@@ -78,13 +78,13 @@ fn term_width() -> Option<usize> {
 }
 
 /// A status banner printed when a run starts.
-pub fn banner(run_id: &str, sandbox: &str, policy: &str, evidence: &str) -> String {
+pub fn banner(run_id: &str, target: &str, policy: &str, evidence: &str) -> String {
     format!(
         "{}  run {}   {} {}   {} {}   {} {}",
         bold("actime"),
         run_id,
-        dim("sandbox:"),
-        sandbox,
+        dim("target:"),
+        target,
         dim("policy:"),
         policy,
         dim("evidence:"),
@@ -125,9 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn banner_mentions_every_plane() {
-        let b = banner("20260804-1", "docker", "enforce", "on");
-        for needle in ["20260804-1", "docker", "enforce", "sandbox", "policy"] {
+    fn banner_mentions_target_and_planes() {
+        let b = banner("20260804-1", "command", "enforce", "on");
+        for needle in ["20260804-1", "command", "enforce", "target", "policy"] {
             assert!(b.contains(needle), "banner missing {needle}: {b}");
         }
     }

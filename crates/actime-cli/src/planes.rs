@@ -112,7 +112,7 @@ fn needs_root_reason(engine: &str) -> String {
     )
 }
 
-/// The policy plane: ActPlane, attached to the sandbox process tree.
+/// The policy plane: ActPlane, attached to the agent process tree.
 pub struct PolicyPlane {
     child: Option<Child>,
     /// How the plane came up.
@@ -141,13 +141,13 @@ pub struct PolicyPlaneSpec<'a> {
     pub feedback: PathBuf,
     /// Where ActPlane writes its audit log.
     pub audit: PathBuf,
-    /// Host pid of the sandbox root process to attach to.
+    /// Host pid of the process tree root to attach to.
     ///
-    /// Ignored when [`Self::wrap_command`] is true (host mode uses
-    /// `actplane run` instead of attach).
+    /// Ignored when [`Self::wrap_command`] is true (`actime run` launches the
+    /// agent under `actplane run` instead of attach-after-spawn).
     pub host_pid: Option<i32>,
     /// When true, only prepare the policy files. The agent is later launched
-    /// under `actplane run` (DESIGN.md §7 host path). Used for `--sandbox host`.
+    /// under `actplane run` so enforcement is launch-time, not post-hoc.
     pub wrap_command: bool,
     /// Whether corrective feedback is delivered to the agent.
     pub feedback_enabled: bool,
@@ -199,12 +199,12 @@ impl PolicyPlane {
             }
         }
 
-        // Host mode (DESIGN.md §7): prepare only; the agent is launched under
+        // Wrap path (DESIGN.md): prepare only; the agent is launched under
         // `actplane run -- <cmd>` so enforcement is launch-time, not post-hoc.
         if spec.wrap_command {
             let version = spec.version.unwrap_or("unknown");
             plane.outcome = Outcome::Active(format!(
-                "actplane {version} · {} · {} · host-wrap{}",
+                "actplane {version} · {} · {} · wrap{}",
                 spec.packs,
                 spec.mode,
                 if spec.feedback_enabled {
@@ -217,9 +217,7 @@ impl PolicyPlane {
         }
 
         let Some(pid) = spec.host_pid else {
-            plane.outcome = Outcome::Disabled(
-                "the sandbox backend does not expose a host pid to attach to".into(),
-            );
+            plane.outcome = Outcome::Disabled("no host pid to attach the policy plane to".into());
             return plane;
         };
 
@@ -254,7 +252,7 @@ impl PolicyPlane {
                     // error (feature-budget mismatch). Treat a log Error as
                     // a failed start so we never claim Active falsely.
                     if let Some(err) = engine_log_error(&spec.log) {
-                        stop_child(&mut Some(child));
+                        stop_child(&mut Some(child), Duration::from_millis(500));
                         plane.outcome =
                             Outcome::Disabled(format!("actplane failed to load policy: {err}"));
                     } else {
@@ -312,9 +310,11 @@ impl PolicyPlane {
         v
     }
 
-    /// Stop the engine. Safe to call more than once. No-op for host-wrap mode.
+    /// Stop the engine. Safe to call more than once. No-op for wrap mode.
+    ///
+    /// Uses a multi-second SIGTERM grace so ActPlane can flush events.jsonl.
     pub fn stop(&mut self) {
-        stop_child(&mut self.child);
+        stop_child(&mut self.child, Duration::from_secs(5));
     }
 }
 
@@ -364,7 +364,7 @@ fn yaml_scalar(p: &Path) -> String {
     format!("{:?}", p.display().to_string())
 }
 
-/// The evidence plane: AgentSight, recording the sandbox process tree.
+/// The evidence plane: AgentSight, recording the agent process tree.
 pub struct EvidencePlane {
     child: Option<Child>,
     /// How the plane came up.
@@ -379,9 +379,9 @@ pub struct EvidencePlaneSpec<'a> {
     pub version: Option<&'a str>,
     /// Whether the evidence plane is wanted at all.
     pub enabled: bool,
-    /// Backend-native target, e.g. `docker://actime-<id>`.
+    /// AgentSight `--binary-path` form when applicable (`docker://…`, `k8s://…`).
     pub target: Option<String>,
-    /// Host pid to attach to when there is no backend-native target.
+    /// Host pid to attach to when there is no scheme target.
     pub host_pid: Option<i32>,
     /// Where the SQLite evidence store is written.
     pub db: PathBuf,
@@ -390,7 +390,7 @@ pub struct EvidencePlaneSpec<'a> {
 }
 
 impl EvidencePlane {
-    /// Attach AgentSight to the sandbox. Never fails for an environment reason.
+    /// Attach AgentSight to the process tree. Never fails for an environment reason.
     pub fn start(spec: EvidencePlaneSpec<'_>) -> EvidencePlane {
         let mut plane = EvidencePlane {
             child: None,
@@ -425,8 +425,9 @@ impl EvidencePlane {
                 args.push(pid.to_string());
             }
             (None, None) => {
-                plane.outcome =
-                    Outcome::Disabled("no sandbox pid or container to attach evidence to".into());
+                plane.outcome = Outcome::Disabled(
+                    "no host pid or container target to attach evidence to".into(),
+                );
                 return plane;
             }
         }
@@ -473,8 +474,11 @@ impl EvidencePlane {
     }
 
     /// Stop the engine. Safe to call more than once.
+    ///
+    /// Agentsight is stopped with a short grace; it is not the source of
+    /// policy violations, and a long wait would slow every short run.
     pub fn stop(&mut self) {
-        stop_child(&mut self.child);
+        stop_child(&mut self.child, Duration::from_secs(1));
     }
 }
 
@@ -789,10 +793,10 @@ fn append_log(path: &Path, text: &str) {
 /// process rather than the engine; SIGTERM propagates and the engines tear the
 /// eBPF programs down on exit.
 ///
-/// Never blocks forever: a stuck engine (or a D-state zombie) must not hang the
-/// run exit path. After a short grace we SIGKILL and abandon an unreapable
-/// child rather than calling blocking `wait()`.
-fn stop_child(slot: &mut Option<Child>) {
+/// `term_grace` is how long to wait after SIGTERM before SIGKILL. ActPlane needs
+/// multi-second grace to flush events.jsonl; agentsight can be shorter. Still
+/// bounded: a stuck engine must not hang the run forever.
+fn stop_child(slot: &mut Option<Child>, term_grace: Duration) {
     let Some(mut child) = slot.take() else {
         return;
     };
@@ -801,10 +805,11 @@ fn stop_child(slot: &mut Option<Child>) {
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
-    for _ in 0..40 {
+    let term_deadline = Instant::now() + term_grace;
+    while Instant::now() < term_deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => return,
         }
     }
@@ -946,7 +951,7 @@ mod tests {
             db: dir.path().join("evidence.db"),
             log: dir.path().join("evidence.log"),
         });
-        assert!(plane.outcome.detail().contains("no sandbox pid"));
+        assert!(plane.outcome.detail().contains("no host pid"));
     }
 
     #[test]

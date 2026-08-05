@@ -5,32 +5,46 @@ types and invariants described here.
 
 ## 1. What Actime is
 
-Actime is a **unified runtime for AI coding agents**. It runs an existing,
-unmodified agent (Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, or any
-command) and wraps it in four planes:
+Actime is the **effect plane for AI coding agents**. It attaches three planes
+to an agent wherever that agent already runs:
 
 | Plane | Component | Question it answers |
 |-------|-----------|---------------------|
-| Isolation | sandbox backend (Docker / Podman / Bubblewrap / host) | What can the agent reach? |
 | Policy | [ActPlane](https://github.com/eunomia-bpf/ActPlane) | What is the agent allowed to do? |
 | Evidence | [AgentSight](https://github.com/eunomia-bpf/agentsight) | What did the agent actually do? |
 | History | [Akeep](https://github.com/eunomia-bpf/akeep) | What did the agent decide, and can we replay it? |
 
-The load-bearing architectural claim:
+Actime does **not** manage sandboxes. Bring your own sandbox, or none at all.
+Actime attaches to the process tree either way.
+
+The roles stay:
 
 > **The sandbox contains. Actime accounts.**
-> Policy and evidence live *outside* the sandbox, in the kernel, on the host.
-> An agent that escapes its tool layer, spawns a shell, or writes a Python
-> subprocess still cannot escape the effect plane, and cannot edit the record.
 
-Default form is **sandboxed**: the agent runs in a container, and the eBPF
-policy/evidence engines attach from the host to the container's process tree.
-`--sandbox host` runs the same planes directly on the host for workstation use.
+That line describes *roles*, not position. The invariant that is always true is
+that Actime observes and enforces **below the tool layer**, at the
+syscall/effect boundary — not that it sits below a sandbox.
+
+### Deployment positions
+
+Actime's position relative to a sandbox is a **deployment choice**, not an
+architectural constraint. All three must work:
+
+| | Position | When | Tamper story |
+|---|----------|------|--------------|
+| **A** | **Outside the sandbox** — Actime on the host, attached to an existing container's process tree | Workstations, CI runners, self-managed Kubernetes nodes where you own the host and have root/`CAP_BPF` | Strongest: root inside the container cannot disable the recorder |
+| **B** | **Inside the sandbox** — Actime in the same container/VM as the agent | E2B, Daytona, AWS AgentCore, managed Kubernetes, someone else's microVM; also shipping Actime inside a vendor image | Weaker: root inside can interfere. Code and docs must say so honestly — never promise host-side tamper-resistance here |
+| **C** | **No sandbox at all** — a process on a machine | Common workstation case | Same as host-side attach to a plain process tree |
+
+For **B**, policy and evidence need `CAP_BPF` (and often `CAP_PERFMON` /
+`CAP_SYS_ADMIN` depending on the kernel) granted to the container. `actime
+doctor` detects in-container deployment and reports this with an actionable fix.
 
 ## 2. Non-goals
 
 - Actime is not an agent framework, agent loop, or model router.
 - Actime does not host compute or sell a microVM fleet.
+- Actime does not create, start, stop, or remove containers or pods.
 - Actime does not proxy LLM traffic or require an SDK.
 - Actime does not build its own eBPF programs. It orchestrates ActPlane and
   AgentSight, which own their kernel code.
@@ -40,15 +54,17 @@ policy/evidence engines attach from the host to the container's process tree.
 ```
 crates/actime-core/      config, profiles, component resolution, run store,
                          evidence aggregation, reports, doctor checks
-crates/actime-sandbox/   Sandbox trait + docker / podman / bwrap / host backends
 crates/actime-cli/       the `actime` binary (clap surface, orchestration)
 profiles/                observe.yaml, balanced.yaml, strict.yaml
 policies/                ActPlane policy packs shipped with actime
-sandbox/                 Dockerfile for the default agent sandbox image
 scripts/install.sh       one-line installer
 docs/                    user documentation
 tests/                   end-to-end integration tests
 ```
+
+Policy packs and profiles are `include_str!`d into the binary by
+`crates/actime-cli/src/embedded.rs`, so a single downloaded binary works with
+nothing else on disk.
 
 ## 4. Configuration: `actime.yaml`
 
@@ -62,21 +78,6 @@ Resolution order (first hit wins, then merged over the named profile):
 ```yaml
 version: 1
 profile: balanced            # observe | balanced | strict | <path to profile yaml>
-
-sandbox:
-  backend: auto              # auto | docker | podman | bwrap | host
-  image: ghcr.io/eunomia-bpf/actime-sandbox:latest
-  workdir: /workspace
-  mounts:                    # host:container:mode
-    - ".:/workspace:rw"
-  network: allow             # allow | deny | egress
-  allow_egress: []           # hostnames allowed when network: egress
-  env_passthrough:           # host env vars copied into the sandbox
-    - ANTHROPIC_API_KEY
-    - OPENAI_API_KEY
-  cpus: null                 # e.g. 4
-  memory: null               # e.g. "8G"
-  keep: false                # keep container after exit for debugging
 
 policy:
   mode: enforce              # off | observe | enforce
@@ -101,7 +102,12 @@ limits:
 ```
 
 Every field is optional. `actime run -- claude` with no config file at all must
-work, using the `balanced` profile and `backend: auto`.
+work, using the `balanced` profile.
+
+`${WORKSPACE}` substitution happens once, in `compose_policy`. Policy files
+must never hardcode a path: the same policy must work at a real host path
+(deployment C) and at a guest path when the user runs Actime inside a container
+(deployment B). For `actime run`, the workspace is the caller's real cwd.
 
 ## 5. Core types (`actime-core`)
 
@@ -113,7 +119,6 @@ updating this document.
 pub struct Config {
     pub version: u32,
     pub profile: String,
-    pub sandbox: SandboxConfig,
     pub policy: PolicyConfig,
     pub evidence: EvidenceConfig,
     pub history: HistoryConfig,
@@ -127,7 +132,6 @@ impl Config {
 }
 
 pub enum PolicyMode { Off, Observe, Enforce }
-pub enum NetworkMode { Allow, Deny, Egress }
 
 // components.rs — resolve the three engines on PATH or in ~/.local/share/actime/bin
 pub struct Component { pub name: &'static str, pub path: Option<PathBuf>, pub version: Option<String>, pub min_version: &'static str }
@@ -153,14 +157,29 @@ pub struct Manifest {
     pub agent: String,                           // "claude" | "codex" | "command"
     pub cwd: PathBuf,
     pub profile: String,
-    pub sandbox: SandboxReport,
+    pub target: TargetReport,
     pub planes: PlaneStatus,                     // which planes were actually active
     pub components: BTreeMap<String, String>,    // name -> version
     pub summary: RunSummary,
     pub exit_code: Option<i32>,
     pub akeep_commit: Option<String>,
 }
-pub struct PlaneStatus { pub isolation: PlaneState, pub policy: PlaneState, pub evidence: PlaneState, pub history: PlaneState }
+
+/// What Actime attached the planes to. Actime never owns this process tree.
+pub struct TargetReport {
+    pub kind: String,                 // "command" | "pid" | "comm" | "container" | "pod"
+    pub spec: Option<String>,         // user-facing handle
+    pub host_pid: Option<i32>,
+    pub evidence_target: Option<String>, // "docker://…" | "k8s://…" when applicable
+    pub note: Option<String>,
+}
+
+/// Exactly three planes. There is no isolation plane.
+pub struct PlaneStatus {
+    pub policy: PlaneState,
+    pub evidence: PlaneState,
+    pub history: PlaneState,
+}
 pub enum PlaneState { Active, Degraded(String), Disabled(String) }
 pub struct RunSummary {
     pub violations: u64, pub blocked: u64, pub killed: u64,
@@ -212,7 +231,7 @@ pub fn run_checks(cfg: &Config) -> Vec<Check>;
   events.jsonl           normalized evidence events (always written)
   stdout.log / stderr.log
   report.md              rendered on exit
-  actplane/              ActPlane-owned feedback tree (host wrap / `actplane run`)
+  actplane/              ActPlane-owned feedback tree (`actplane run` wrap)
     feedback.txt         corrective feedback (seed path; engine may re-scope)
     audit.jsonl
     runs/run-<pid>-<ts>/  scoped per-invocation dir written by ActPlane 0.1.x
@@ -230,156 +249,128 @@ in the run directory as the composed DSL alone for inspection and diffs.
 paths through `scoped_feedback_paths`, placing events under
 `parent(feedback)/runs/run-<pid>-<ts>/events.jsonl` rather than the `events:`
 path in policy.yaml. Actime therefore seeds feedback under `actplane/` and
-**harvests** those scoped `events.jsonl` files into `violations.jsonl` before
-rendering the report. The nested `actplane/runs/` tree is expected, not a leak.
+**harvests** those scoped `events.jsonl` files into `violations.jsonl` after the
+engine has fully exited.
 
-**Host wrap teardown:** the sandbox child under `--sandbox host` with an active
-policy is `actplane run -- <agent>`. If that process outlives the agent
-(stuck eBPF event-loop join), Actime reaps it after a short idle window so
-`finish()` always runs.
+**Policy-wrap teardown:** when policy is on, `actime run` launches the agent
+under `actplane run -- <agent>`. If that process outlives the agent, Actime
+waits for a natural exit so events can flush, then SIGTERM with a multi-second
+grace, then SIGKILL. Harvest runs only after the engine has exited. A tool that
+enforces a kill and then loses the event is worse than useless — but nothing
+may hang a run forever.
 
-## 6. Sandbox contract (`actime-sandbox`)
+## 6. Target model
 
-```rust
-pub struct SandboxSpec {
-    pub image: String,
-    pub workdir: PathBuf,
-    pub mounts: Vec<Mount>,
-    pub env: Vec<(String, String)>,
-    pub network: NetworkMode,
-    pub allow_egress: Vec<String>,
-    pub cpus: Option<f64>,
-    pub memory: Option<String>,
-    pub keep: bool,
-    pub name: String,             // "actime-<run-id>"
-}
+Actime records a [`TargetReport`] in every manifest: what process tree the
+planes attached to.
 
-pub struct Mount { pub host: PathBuf, pub guest: PathBuf, pub readonly: bool }
+| `kind` | How it is resolved |
+|--------|--------------------|
+| `command` | `actime run -- <cmd>`: plain host child (or under `actplane run` when policy is on) |
+| `pid` | `actime attach --pid N` |
+| `comm` | `actime attach --comm NAME` (newest matching `/proc/*/comm`) |
+| `container` | `actime attach --container REF` → `docker inspect` / `podman inspect` for host pid; evidence target `docker://REF` |
+| `pod` | `actime attach --pod NS/POD` → `kubectl get pod -o json` → containerID → docker/podman/crictl inspect; evidence target `k8s://NS/POD` |
 
-/// A live sandbox instance.
-pub trait Sandbox: Send {
-    fn kind(&self) -> Backend;
-    /// PID on the *host* of the sandbox's root process. This is the anchor the
-    /// policy and evidence planes attach to. `None` means the backend cannot
-    /// expose one, and eBPF planes must degrade.
-    fn host_pid(&self) -> Option<i32>;
-    /// Backend-native target string for AgentSight `--binary-path`,
-    /// e.g. "docker://actime-<id>". `None` for host mode.
-    fn evidence_target(&self) -> Option<String>;
-    /// Bring the sandbox up *without* starting the agent. After this returns,
-    /// `host_pid()` and `evidence_target()` must be usable, so the policy and
-    /// evidence planes can attach before any agent code runs. For Docker and
-    /// Podman this starts the container detached with a long-lived idle
-    /// entrypoint. For bwrap and host it is a no-op.
-    fn start(&mut self) -> Result<()>;
-    /// Start the agent inside the already-started sandbox. Non-blocking.
-    fn spawn(&mut self, argv: &[String]) -> Result<()>;
-    fn wait(&mut self) -> Result<i32>;
-    fn signal(&mut self, sig: i32) -> Result<()>;
-    fn cleanup(&mut self) -> Result<()>;
-    fn report(&self) -> SandboxReport;
-}
+Actime **never** creates, starts, stops, or removes a container or pod. If the
+target does not exist, print a clear error and stop.
 
-pub enum Backend { Docker, Podman, Bwrap, Host }
-
-impl Backend {
-    /// Probe order for `auto`: Docker, Podman, Bubblewrap, Host.
-    pub fn detect_available() -> Vec<Backend>;
-    pub fn probe(&self) -> BackendProbe;      // available? why not? version?
-}
-
-pub fn create(backend: Backend, spec: SandboxSpec) -> Result<Box<dyn Sandbox>>;
-```
-
-Backend rules:
-
-- **Docker / Podman** — the default. Container named `actime-<run-id>`, image
-  `sandbox/Dockerfile`. The workspace is bind-mounted. `host_pid()` comes from
-  `inspect --format '{{.State.Pid}}'`. `network: deny` uses `--network none`;
-  `network: egress` starts the container on an internal network and is
-  documented as best-effort at the DNS level, with the authoritative egress
-  control coming from the ActPlane `connect` rules.
-- **Bwrap** — `bubblewrap` namespace sandbox for machines with no container
-  runtime. Read-only `/`, writable workspace and `$HOME/.cache`, `--die-with-parent`.
-  `host_pid()` is the direct child pid.
-- **Host** — no isolation. Runs the command as a normal child. Must still work
-  and must print a one-line warning that the isolation plane is off.
-
-Every backend must work with **no privileges**. Only the policy and evidence
-planes need root, and both degrade to disabled with a clear reason.
+AgentSight already understands `docker://` and `k8s://` as `--binary-path`
+schemes; Actime passes those through when applicable.
 
 ## 7. Orchestration (`actime-cli`)
 
-`actime run -- <argv>` executes this sequence. Every step is fail-soft except
-step 4 in `enforce` mode.
+### `actime run -- <argv>`
+
+Launches the agent as a plain child in the user's real cwd and environment.
+No container is created, ever.
 
 1. Resolve config, profile, CLI overrides. Resolve components.
 2. `RunStore::create` → run directory, write effective `actime.yaml`.
-3. Create the sandbox (`Backend::detect_available` when `auto`) and call
-   `start()`, so `host_pid()` is known before the agent exists.
-4. Start the **policy plane**: compile the merged policy packs with
-   `actplane compile`, then `actplane attach --pid <host_pid>` (sandbox) or
-   `actplane run` (host). In `enforce` mode a failure here aborts the run:
-   fail closed. In `observe` mode it degrades. Violations are tailed into
-   `violations.jsonl`.
-5. Start the **evidence plane**: `agentsight record --binary-path <target>` or
-   `agentsight record -- <argv>` for host mode, writing into the run directory.
-   Always fail-soft.
-6. Spawn the agent, stream stdio, forward signals, enforce `limits.wall_clock`.
-7. On exit: stop the planes, collect `Evidence`, update the manifest, run
-   `akeep commit` when history is enabled, render `report.md`, print the summary.
+3. Compose policy with `${WORKSPACE}` = the real host cwd.
+4. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
+   wrap the agent with `actplane run -- <argv>` (launch-time enforcement).
+   In `enforce` mode a failure to start aborts the run (fail closed).
+5. **Evidence plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
+   once the child exists. Always fail-soft.
+6. Wait for the agent / wrap. Enforce `limits.wall_clock`. Prefer natural
+   engine exit so events flush; then SIGTERM with a long grace; then SIGKILL.
+7. On exit: stop engines (bounded), **harvest violations only after engines
+   have exited**, collect `Evidence`, update the manifest, run `akeep commit`
+   when history is enabled, render `report.md`, print the summary.
 
-The exit code of `actime run` is the agent's exit code. `--fail-on-violation`
-makes any `kill`/`block` violation force exit code 3.
+The exit code of `actime run` is the agent's exit code when known.
+`--fail-on-violation` makes any `kill`/`block` violation force exit code 3.
+
+### `actime attach`
+
+Binds the planes to something already running. Does not reconstruct past
+events. Holds until the target exits or the user detaches (Ctrl-C).
 
 ## 8. Degradation matrix
 
-This is what makes Actime work out of the box. No step below is an error.
+This is what makes Actime work out of the box. No step below is an error —
+except `policy.mode: enforce`, which fails closed if the policy plane cannot
+load.
 
 | Missing | Effect |
 |---------|--------|
-| root / `CAP_BPF` | policy + evidence disabled, isolation + history still run; `doctor` explains |
-| Docker and Podman | fall back to bwrap, then host, with a warning |
+| root / `CAP_BPF` | policy + evidence disabled; history still runs; `doctor` explains |
+| running inside a container without CAP_BPF | same; doctor warns that this is deployment B without host-side tamper-resistance |
 | `actplane` binary | policy plane disabled in `observe`; hard error in `enforce` |
 | `agentsight` binary | evidence plane disabled; process-level fallback still records argv, exit, duration |
 | `akeep` binary | history plane disabled |
 | kernel < 5.10 | policy plane disabled with the kernel version in the reason |
 
 `actime run` always produces a manifest and a report, even when only the
-process-level fallback ran.
+process-level fallback ran. Nothing in the exit path may be conditional on a
+plane having worked.
 
 ## 9. Profiles
 
-- **observe** — sandbox `auto`, policy `observe`, evidence on, history on.
-  Nothing is ever blocked. The onboarding default for a new team.
-- **balanced** (default) — sandbox `auto`, policy `enforce` with the
-  `coding-agent-baseline` pack, evidence on, history on. Blocks destructive and
-  exfiltration-shaped effects, allows normal development.
-- **strict** — sandbox required (run fails if only host is available), policy
-  `enforce` with `coding-agent-baseline` + `no-egress` + `no-vcs-write`,
-  `network: egress` with an explicit allowlist, evidence on with `otlp` export.
+- **observe** — policy `observe`, evidence on, history on. Nothing is ever
+  blocked. The onboarding default for a new team.
+- **balanced** (default) — policy `enforce` with the `coding-agent-baseline`
+  pack, evidence on, history on. Blocks destructive and exfiltration-shaped
+  effects, allows normal development.
+- **strict** — policy `enforce` with `coding-agent-baseline` + `no-vcs-write` +
+  `no-secret-egress`, evidence on with `otlp` export, optional wall-clock
+  limit. Fail closed on the policy plane.
 
 ## 10. CLI surface
 
 ```
-actime init [--profile P] [--force]
-actime run [--sandbox B] [--policy MODE] [--profile P] [--no-evidence]
-           [--no-history] [--fail-on-violation] [--] <cmd>...
-actime shell [--sandbox B]
-actime attach (--pid N | --comm NAME)
+actime init [--force] [--print]
+actime run [--policy MODE] [--no-evidence] [--no-history]
+           [--fail-on-violation] [--timeout D] -- <cmd>...
+actime attach (--pid N | --comm NAME | --container REF | --pod NS/POD)
+              [--policy MODE]
 actime status
 actime runs [--json] [--limit N]
 actime report [RUN|latest] [--json|--markdown]
 actime policy (list | show PACK | check | explain)
-actime keep (commit [-m MSG] | log | restore RUN)
-actime sandbox (info | build | pull)
+actime keep (commit [-m MSG] | log | restore RUN [--to DIR])
 actime doctor [--json]
-actime demo
 ```
 
-## 11. Demo
+Global flags: `--config FILE`, `--profile NAME`, `--quiet`.
 
-`actime demo` must work on a laptop with no agent installed, no root, and no
-Docker. It runs a bundled script that reads files, spawns subprocesses, opens a
-network connection, and attempts one policy-violating action, then prints the
-report. This is the 30-second proof that the whole pipeline is wired.
+There is no `sandbox` subcommand, no `--sandbox` flag, no `demo` command, and
+no `shell` command. Isolation is the user's responsibility.
+
+## 11. Rules that are easy to get wrong
+
+- **Fail soft everywhere except `enforce`.** A missing engine, no root, an old
+  kernel — none of these may abort a run. They degrade a plane and record the
+  reason in the manifest. The one exception is `policy.mode: enforce`.
+- **Every run produces a manifest and a report**, even when only the
+  process-level fallback ran.
+- **Never create containers.** `attach --container` / `--pod` only resolve
+  already-existing targets.
+- **Harvest after engine exit.** Violations already produced by the kernel must
+  not be lost because Actime reaped ActPlane before it flushed.
+- **No unwrap/expect/panic in non-test code.** Return `anyhow::Result`.
+- **Do not promise host-side tamper-resistance in deployment B.** Doctor and
+  docs must state the weaker story honestly.
+- **AgentSight's SQLite schema is not a stable interface.** Query
+  `sqlite_master` and `PRAGMA table_info` before selecting.

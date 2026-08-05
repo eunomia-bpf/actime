@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/actime-core",
-    "crates/actime-sandbox",
     "crates/actime-cli",
 ]
 
@@ -17,7 +16,6 @@ authors = ["The eunomia-bpf authors"]
 
 [workspace.dependencies]
 actime-core = { version = "0.1.0", path = "crates/actime-core" }
-actime-sandbox = { version = "0.1.0", path = "crates/actime-sandbox" }
 
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

@@ -153,45 +153,6 @@ impl FromStr for PolicyMode {
     }
 }
 
-/// Network policy applied inside the sandbox.
-///
-/// Authoritative egress filtering for [`NetworkMode::Egress`] is performed by
-/// ActPlane; the sandbox only applies a best-effort default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkMode {
-    /// Full network access.
-    #[default]
-    Allow,
-    /// No network.
-    Deny,
-    /// Restricted egress (allowlist + ActPlane).
-    Egress,
-}
-
-impl fmt::Display for NetworkMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NetworkMode::Allow => write!(f, "allow"),
-            NetworkMode::Deny => write!(f, "deny"),
-            NetworkMode::Egress => write!(f, "egress"),
-        }
-    }
-}
-
-impl FromStr for NetworkMode {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "allow" => Ok(NetworkMode::Allow),
-            "deny" => Ok(NetworkMode::Deny),
-            "egress" => Ok(NetworkMode::Egress),
-            other => bail!("unknown network mode `{other}` (expected allow|deny|egress)"),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Config structs
 // ---------------------------------------------------------------------------
@@ -205,9 +166,6 @@ pub struct Config {
     /// Named profile this config is based on (`observe` | `balanced` | `strict`).
     #[serde(default = "default_profile")]
     pub profile: String,
-    /// Isolation plane settings.
-    #[serde(default)]
-    pub sandbox: SandboxConfig,
     /// Policy plane settings.
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -235,87 +193,11 @@ impl Default for Config {
         Self::builtin_profile("balanced").unwrap_or_else(|_| Config {
             version: 1,
             profile: "balanced".into(),
-            sandbox: SandboxConfig::default(),
             policy: PolicyConfig::default(),
             evidence: EvidenceConfig::default(),
             history: HistoryConfig::default(),
             limits: LimitsConfig::default(),
         })
-    }
-}
-
-/// Sandbox / isolation settings.
-///
-/// The `backend` field is a plain [`String`] (`"auto"`, `"docker"`, …) so this
-/// crate does not depend on `actime-sandbox`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxConfig {
-    /// Backend name: `auto` | `docker` | `podman` | `bwrap` | `host`.
-    #[serde(default = "default_backend")]
-    pub backend: String,
-    /// Container image for docker/podman backends.
-    #[serde(default = "default_image")]
-    pub image: String,
-    /// Working directory inside the sandbox.
-    #[serde(default = "default_workdir")]
-    pub workdir: String,
-    /// Bind mounts as `host:guest[:ro|rw]` strings.
-    #[serde(default = "default_mounts")]
-    pub mounts: Vec<String>,
-    /// Network mode.
-    #[serde(default)]
-    pub network: NetworkMode,
-    /// Hostnames allowed when `network: egress`.
-    #[serde(default)]
-    pub allow_egress: Vec<String>,
-    /// Host env var names copied into the sandbox.
-    #[serde(default = "default_env_passthrough")]
-    pub env_passthrough: Vec<String>,
-    /// Optional CPU limit (e.g. `4.0`).
-    #[serde(default)]
-    pub cpus: Option<f64>,
-    /// Optional memory limit (e.g. `"8G"`).
-    #[serde(default)]
-    pub memory: Option<String>,
-    /// Keep the container after exit for debugging.
-    #[serde(default)]
-    pub keep: bool,
-}
-
-fn default_backend() -> String {
-    "auto".into()
-}
-
-fn default_image() -> String {
-    "ghcr.io/eunomia-bpf/actime-sandbox:latest".into()
-}
-
-fn default_workdir() -> String {
-    "/workspace".into()
-}
-
-fn default_mounts() -> Vec<String> {
-    vec![".:/workspace:rw".into()]
-}
-
-fn default_env_passthrough() -> Vec<String> {
-    vec!["ANTHROPIC_API_KEY".into(), "OPENAI_API_KEY".into()]
-}
-
-impl Default for SandboxConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_backend(),
-            image: default_image(),
-            workdir: default_workdir(),
-            mounts: default_mounts(),
-            network: NetworkMode::Allow,
-            allow_egress: Vec::new(),
-            env_passthrough: default_env_passthrough(),
-            cpus: None,
-            memory: None,
-            keep: false,
-        }
     }
 }
 
@@ -436,8 +318,6 @@ pub struct LimitsConfig {
 /// Optional flags from the CLI layered onto a loaded [`Config`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliOverrides {
-    /// `--sandbox <backend>`.
-    pub sandbox_backend: Option<String>,
     /// `--policy <mode>`.
     pub policy_mode: Option<PolicyMode>,
     /// `--profile <name>`.
@@ -455,10 +335,6 @@ pub struct CliOverrides {
 const PROFILE_OBSERVE: &str = r#"
 version: 1
 profile: observe
-sandbox:
-  backend: auto
-  workdir: /workspace
-  network: allow
 policy:
   mode: observe
   packs:
@@ -476,10 +352,6 @@ history:
 const PROFILE_BALANCED: &str = r#"
 version: 1
 profile: balanced
-sandbox:
-  backend: auto
-  workdir: /workspace
-  network: allow
 policy:
   mode: enforce
   packs:
@@ -497,21 +369,6 @@ history:
 const PROFILE_STRICT: &str = r#"
 version: 1
 profile: strict
-sandbox:
-  backend: auto
-  workdir: /workspace
-  network: egress
-  allow_egress:
-    - api.anthropic.com
-    - api.openai.com
-    - generativelanguage.googleapis.com
-    - registry.npmjs.org
-    - pypi.org
-    - files.pythonhosted.org
-    - crates.io
-    - static.crates.io
-    - github.com
-    - codeload.github.com
 policy:
   mode: enforce
   packs:
@@ -605,9 +462,6 @@ impl Config {
 
     /// Apply CLI overrides in place.
     pub fn merge_cli(&mut self, overrides: &CliOverrides) {
-        if let Some(ref backend) = overrides.sandbox_backend {
-            self.sandbox.backend = backend.clone();
-        }
         if let Some(mode) = overrides.policy_mode {
             self.policy.mode = mode;
         }
@@ -682,25 +536,10 @@ fn user_config_path() -> Option<PathBuf> {
 struct PartialConfig {
     version: Option<u32>,
     profile: Option<String>,
-    sandbox: Option<PartialSandbox>,
     policy: Option<PartialPolicy>,
     evidence: Option<PartialEvidence>,
     history: Option<PartialHistory>,
     limits: Option<PartialLimits>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct PartialSandbox {
-    backend: Option<String>,
-    image: Option<String>,
-    workdir: Option<String>,
-    mounts: Option<Vec<String>>,
-    network: Option<NetworkMode>,
-    allow_egress: Option<Vec<String>>,
-    env_passthrough: Option<Vec<String>>,
-    cpus: Option<f64>,
-    memory: Option<String>,
-    keep: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -738,38 +577,6 @@ fn merge_partial(cfg: &mut Config, p: PartialConfig) {
     }
     if let Some(profile) = p.profile {
         cfg.profile = profile;
-    }
-    if let Some(s) = p.sandbox {
-        if let Some(v) = s.backend {
-            cfg.sandbox.backend = v;
-        }
-        if let Some(v) = s.image {
-            cfg.sandbox.image = v;
-        }
-        if let Some(v) = s.workdir {
-            cfg.sandbox.workdir = v;
-        }
-        if let Some(v) = s.mounts {
-            cfg.sandbox.mounts = v;
-        }
-        if let Some(v) = s.network {
-            cfg.sandbox.network = v;
-        }
-        if let Some(v) = s.allow_egress {
-            cfg.sandbox.allow_egress = v;
-        }
-        if let Some(v) = s.env_passthrough {
-            cfg.sandbox.env_passthrough = v;
-        }
-        if s.cpus.is_some() {
-            cfg.sandbox.cpus = s.cpus;
-        }
-        if s.memory.is_some() {
-            cfg.sandbox.memory = s.memory;
-        }
-        if let Some(v) = s.keep {
-            cfg.sandbox.keep = v;
-        }
     }
     if let Some(pol) = p.policy {
         if let Some(v) = pol.mode {
@@ -863,11 +670,9 @@ mod tests {
         assert_eq!(bal.profile, "balanced");
         assert_eq!(bal.policy.mode, PolicyMode::Enforce);
         assert_eq!(bal.policy.packs, vec!["coding-agent-baseline"]);
-        assert_eq!(bal.sandbox.backend, "auto");
 
         let strict = Config::builtin_profile("strict").unwrap();
         assert_eq!(strict.profile, "strict");
-        assert_eq!(strict.sandbox.network, NetworkMode::Egress);
         assert!(strict.policy.packs.contains(&"no-vcs-write".to_string()));
         assert_eq!(
             strict.limits.wall_clock,
@@ -884,7 +689,6 @@ mod tests {
             let back: Config = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(back.profile, cfg.profile);
             assert_eq!(back.policy.mode, cfg.policy.mode);
-            assert_eq!(back.sandbox.network, cfg.sandbox.network);
             assert_eq!(back.limits.wall_clock, cfg.limits.wall_clock);
         }
     }
@@ -893,14 +697,12 @@ mod tests {
     fn merge_cli_overrides() {
         let mut cfg = Config::builtin_profile("balanced").unwrap();
         let ov = CliOverrides {
-            sandbox_backend: Some("host".into()),
             policy_mode: Some(PolicyMode::Observe),
             profile: Some("custom".into()),
             no_evidence: Some(true),
             no_history: Some(true),
         };
         cfg.merge_cli(&ov);
-        assert_eq!(cfg.sandbox.backend, "host");
         assert_eq!(cfg.policy.mode, PolicyMode::Observe);
         assert_eq!(cfg.profile, "custom");
         assert!(!cfg.evidence.enabled);
@@ -912,15 +714,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("actime.yaml");
         let mut f = fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            "profile: observe\nsandbox:\n  backend: host\npolicy:\n  mode: off\n"
-        )
-        .unwrap();
+        writeln!(f, "profile: observe\npolicy:\n  mode: off\n").unwrap();
 
         let cfg = Config::load(Some(&path), dir.path()).unwrap();
         assert_eq!(cfg.profile, "observe");
-        assert_eq!(cfg.sandbox.backend, "host");
         assert_eq!(cfg.policy.mode, PolicyMode::Off);
         assert!(!cfg.policy.feedback);
         assert!(cfg.evidence.enabled);
@@ -939,7 +736,6 @@ mod tests {
         let cfg: Config = serde_yaml::from_str("{}").unwrap();
         assert_eq!(cfg.version, 1);
         assert_eq!(cfg.profile, "balanced");
-        assert_eq!(cfg.sandbox.backend, "auto");
         assert_eq!(cfg.policy.mode, PolicyMode::Enforce);
     }
 
@@ -950,11 +746,5 @@ mod tests {
             PolicyMode::Enforce
         );
         assert!(PolicyMode::from_str("weird").is_err());
-    }
-
-    #[test]
-    fn network_mode_parse() {
-        assert_eq!(NetworkMode::from_str("deny").unwrap(), NetworkMode::Deny);
-        assert_eq!(NetworkMode::Allow.to_string(), "allow");
     }
 }

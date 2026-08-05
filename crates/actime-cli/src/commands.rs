@@ -1,5 +1,5 @@
-//! Everything that is not `run`: init, status, runs, report, policy, keep,
-//! sandbox, and doctor.
+//! Everything that is not `run` / `attach`: init, status, runs, report, policy,
+//! keep, and doctor.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -12,7 +12,6 @@ use actime_core::doctor::{self, CheckStatus};
 use actime_core::evidence::Evidence;
 use actime_core::report;
 use actime_core::run::RunStore;
-use actime_sandbox::Backend;
 
 use crate::embedded;
 use crate::planes;
@@ -72,8 +71,7 @@ pub fn init(ctx: &Context, force: bool, print: bool) -> Result<i32> {
     eprintln!();
     eprintln!("Next:");
     eprintln!("  actime doctor         see which planes this machine supports");
-    eprintln!("  actime demo           watch the whole pipeline run");
-    eprintln!("  actime run -- claude  run your agent");
+    eprintln!("  actime run -- claude  run your agent under the three planes");
     Ok(0)
 }
 
@@ -90,11 +88,11 @@ pub fn status(_ctx: &Context) -> Result<i32> {
         return Ok(0);
     }
 
-    println!("{:<26} {:<12} {:<10} STARTED", "RUN", "AGENT", "SANDBOX");
+    println!("{:<26} {:<12} {:<12} STARTED", "RUN", "AGENT", "TARGET");
     for m in live {
         println!(
-            "{:<26} {:<12} {:<10} {}",
-            m.id, m.agent, m.sandbox.backend, m.started_at
+            "{:<26} {:<12} {:<12} {}",
+            m.id, m.agent, m.target.kind, m.started_at
         );
     }
     Ok(0)
@@ -114,20 +112,20 @@ pub fn runs(_ctx: &Context, json: bool, limit: usize) -> Result<i32> {
     if manifests.is_empty() {
         println!("No runs recorded yet.");
         println!();
-        println!("{}", ui::dim("Try `actime demo`."));
+        println!("{}", ui::dim("Try `actime run -- /bin/echo hi`."));
         return Ok(0);
     }
 
     println!(
-        "{:<26} {:<10} {:<8} {:<8} {:<6} VIOLATIONS",
-        "RUN", "AGENT", "SANDBOX", "POLICY", "EXIT"
+        "{:<26} {:<10} {:<10} {:<8} {:<6} VIOLATIONS",
+        "RUN", "AGENT", "TARGET", "POLICY", "EXIT"
     );
     for m in &manifests {
         println!(
-            "{:<26} {:<10} {:<8} {:<8} {:<6} {}",
+            "{:<26} {:<10} {:<10} {:<8} {:<6} {}",
             m.id,
             truncate(&m.agent, 10),
-            truncate(&m.sandbox.backend, 8),
+            truncate(&m.target.kind, 10),
             truncate(m.planes.policy.label(), 8),
             m.exit_code
                 .map(|c| c.to_string())
@@ -143,7 +141,7 @@ pub fn report(_ctx: &Context, id: &str, json: bool, markdown: bool) -> Result<i3
     let store = RunStore::open_default()?;
     let run = store.get(id).with_context(|| {
         if id == "latest" {
-            "no runs recorded yet. Try `actime demo`.".to_string()
+            "no runs recorded yet. Try `actime run -- /bin/echo hi`.".to_string()
         } else {
             format!("no run `{id}`. Use `actime runs` to list them.")
         }
@@ -437,125 +435,12 @@ pub fn keep_restore(_ctx: &Context, id: &str, to: Option<PathBuf>) -> Result<i32
     Ok(status.code().unwrap_or(1))
 }
 
-/// `actime sandbox info`.
-pub fn sandbox_info() -> Result<i32> {
-    println!("Sandbox backends, in the order `auto` probes them:");
-    println!();
-    for backend in [
-        Backend::Docker,
-        Backend::Podman,
-        Backend::Bwrap,
-        Backend::Host,
-    ] {
-        let probe = backend.probe();
-        let (mark, name) = if probe.available {
-            (ui::green("available"), backend.as_str())
-        } else {
-            (ui::dim("unavailable"), backend.as_str())
-        };
-        println!("  {:<10} {}", name, mark);
-        let detail = probe.format_reason(backend);
-        if !detail.trim().is_empty() {
-            println!("             {}", ui::dim(&detail));
-        }
-    }
-    println!();
-    let chosen = Backend::detect_available();
-    if let Some(first) = chosen.first() {
-        println!(
-            "`--sandbox auto` would choose: {}",
-            ui::bold(first.as_str())
-        );
-    }
-    Ok(0)
-}
-
-/// `actime sandbox build`.
-pub fn sandbox_build(ctx: &Context, tag: Option<String>) -> Result<i32> {
-    let cwd = std::env::current_dir()?;
-    let cfg = ctx.load_config(&cwd)?;
-    let tag = tag.unwrap_or(cfg.sandbox.image.clone());
-
-    let dockerfile = find_dockerfile(&cwd).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not find sandbox/Dockerfile. Run this from an actime checkout, or \
-             build your own image and set `sandbox.image` in actime.yaml."
-        )
-    })?;
-    let context_dir = dockerfile
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(&cwd)
-        .to_path_buf();
-
-    let engine = container_engine()?;
-    let status = Command::new(&engine)
-        .arg("build")
-        .arg("-t")
-        .arg(&tag)
-        .arg("-f")
-        .arg(&dockerfile)
-        .arg(&context_dir)
-        .status()
-        .with_context(|| format!("running `{engine} build`"))?;
-    Ok(status.code().unwrap_or(1))
-}
-
-/// `actime sandbox pull`.
-pub fn sandbox_pull(ctx: &Context) -> Result<i32> {
-    let cwd = std::env::current_dir()?;
-    let cfg = ctx.load_config(&cwd)?;
-    let engine = container_engine()?;
-    let status = Command::new(&engine)
-        .args(["pull", &cfg.sandbox.image])
-        .status()
-        .with_context(|| format!("running `{engine} pull`"))?;
-    Ok(status.code().unwrap_or(1))
-}
-
-fn container_engine() -> Result<String> {
-    for backend in [Backend::Docker, Backend::Podman] {
-        if backend.probe().available {
-            return Ok(backend.as_str().to_string());
-        }
-    }
-    bail!("neither Docker nor Podman is available. `actime sandbox info` explains why.")
-}
-
-fn find_dockerfile(start: &std::path::Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        let candidate = d.join("sandbox").join("Dockerfile");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 /// `actime doctor`.
 pub fn doctor(ctx: &Context, json: bool) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     // A broken config must not stop the diagnosis; that is what doctor is for.
     let cfg = ctx.load_config(&cwd).unwrap_or_default();
-    let mut checks = doctor::run_checks(&cfg);
-
-    // The sandbox probes live in actime-sandbox, so they are added here rather
-    // than in core.
-    for backend in [Backend::Docker, Backend::Podman, Backend::Bwrap] {
-        let probe = backend.probe();
-        checks.push(doctor::Check {
-            name: format!("sandbox: {}", backend.as_str()),
-            status: if probe.available {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Skip
-            },
-            detail: probe.format_reason(backend),
-            fix: None,
-        });
-    }
+    let checks = doctor::run_checks(&cfg);
 
     if json {
         println!("{}", serde_json::to_string_pretty(&checks)?);
@@ -627,23 +512,6 @@ mod tests {
     fn truncate_keeps_short_strings_and_marks_long_ones() {
         assert_eq!(truncate("claude", 10), "claude");
         assert_eq!(truncate("a-very-long-agent-name", 8), "a-very-…");
-    }
-
-    #[test]
-    fn find_dockerfile_walks_upward() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let nested = dir.path().join("a").join("b");
-        std::fs::create_dir_all(&nested).expect("mkdir");
-        std::fs::create_dir_all(dir.path().join("sandbox")).expect("mkdir");
-        std::fs::write(dir.path().join("sandbox").join("Dockerfile"), "FROM x").expect("write");
-        let found = find_dockerfile(&nested).expect("found");
-        assert!(found.ends_with("sandbox/Dockerfile"));
-    }
-
-    #[test]
-    fn find_dockerfile_returns_none_when_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(find_dockerfile(dir.path()).is_none());
     }
 
     #[test]

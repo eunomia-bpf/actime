@@ -105,7 +105,8 @@ impl Check {
 
 /// Run all doctor checks against the current environment and `cfg`.
 ///
-/// Checks (DESIGN.md §5 / §8):
+/// Checks (DESIGN.md):
+/// - Deployment position (host vs inside a container)
 /// - OS is Linux
 /// - Kernel ≥ 5.10 for policy; note 6.1+ for full runtime
 /// - BTF at `/sys/kernel/btf/vmlinux`
@@ -116,6 +117,7 @@ impl Check {
 pub fn run_checks(cfg: &Config) -> Vec<Check> {
     let components = Components::detect();
     vec![
+        check_deployment(),
         check_os(),
         check_kernel(),
         check_btf(),
@@ -126,6 +128,75 @@ pub fn run_checks(cfg: &Config) -> Vec<Check> {
         check_run_store(),
         check_config(cfg),
     ]
+}
+
+/// Detect whether Actime is running inside a container (deployment B) or on a
+/// host (A/C). This is a deployment choice, not an architecture constraint.
+fn check_deployment() -> Check {
+    if inside_container() {
+        Check::warn(
+            "deployment",
+            "running inside a container (deployment B: in-sandbox Actime). \
+             Policy and evidence need CAP_BPF (and often CAP_PERFMON / CAP_SYS_ADMIN) \
+             granted to this container. In-container deployment does not provide the \
+             host-side tamper-resistance guarantee: root inside can interfere with the recorder.",
+            "Grant CAP_BPF (+CAP_PERFMON/CAP_SYS_ADMIN as required by the kernel) to this \
+             container, or run Actime on the host and `actime attach --container` / \
+             `--pod` for the stronger host-side position (deployment A).",
+        )
+    } else {
+        Check::ok(
+            "deployment",
+            "running on a host (deployment A/C). Host-side attach is available and is the \
+             stronger tamper-resistance position: attach to an existing container with \
+             `actime attach --container` / `--pod`, or run the agent as a plain child with \
+             `actime run`.",
+        )
+    }
+}
+
+/// Best-effort container detection for doctor.
+fn inside_container() -> bool {
+    if PathBuf::from("/.dockerenv").exists() {
+        return true;
+    }
+    if PathBuf::from("/run/.containerenv").exists() {
+        return true;
+    }
+    // cgroup v1/v2: docker, containerd, kubepods, lxc, podman markers.
+    if let Ok(cg) = fs::read_to_string("/proc/1/cgroup") {
+        let lower = cg.to_ascii_lowercase();
+        for needle in [
+            "docker",
+            "containerd",
+            "kubepods",
+            "cri-containerd",
+            "libpod",
+            "lxc",
+            "podman",
+        ] {
+            if lower.contains(needle) {
+                return true;
+            }
+        }
+    }
+    // cgroup namespace: if pid 1's cgroup path is not the host root.
+    if let Ok(cg) = fs::read_to_string("/proc/1/cgroup") {
+        // On a bare host, lines often end with just "/". Nested paths are common in containers.
+        let mut non_root = false;
+        for line in cg.lines() {
+            if let Some(path) = line.split(':').nth(2) {
+                if path != "/" && path != "/init.scope" && !path.is_empty() {
+                    // Avoid false positives on systemd user slices on hosts: only
+                    // treat as container when combined with known markers above.
+                    let _ = path;
+                    non_root = true;
+                }
+            }
+        }
+        let _ = non_root;
+    }
+    false
 }
 
 fn check_os() -> Check {
@@ -290,10 +361,9 @@ fn check_config(cfg: &Config) -> Check {
     Check::ok(
         "config",
         format!(
-            "profile={} policy={} sandbox.backend={} evidence={} history={}",
+            "profile={} policy={} evidence={} history={}",
             cfg.profile,
             cfg.policy.mode,
-            cfg.sandbox.backend,
             if cfg.evidence.enabled { "on" } else { "off" },
             if cfg.history.enabled { "on" } else { "off" },
         ),
@@ -363,6 +433,7 @@ mod tests {
         let cfg = Config::builtin_profile("balanced").unwrap();
         let checks = run_checks(&cfg);
         let names: Vec<_> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"deployment"));
         assert!(names.contains(&"os"));
         assert!(names.contains(&"kernel"));
         assert!(names.contains(&"btf"));
@@ -383,6 +454,25 @@ mod tests {
                 );
             }
         }
+        // Doctor must not claim Actime manages a sandbox.
+        for c in &checks {
+            let blob = format!("{} {} {}", c.name, c.detail, c.fix.as_deref().unwrap_or(""));
+            assert!(
+                !blob.to_ascii_lowercase().contains("sandbox backend"),
+                "doctor still mentions sandbox backends: {blob}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_check_reports_a_mode() {
+        let c = check_deployment();
+        assert_eq!(c.name, "deployment");
+        assert!(
+            c.detail.contains("host") || c.detail.contains("container"),
+            "detail={}",
+            c.detail
+        );
     }
 
     #[test]

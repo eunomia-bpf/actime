@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, NetworkMode};
+use crate::config::Config;
 
 // ---------------------------------------------------------------------------
 // RunId
@@ -147,8 +147,6 @@ impl PlaneState {
 /// Which planes were actually active for a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaneStatus {
-    /// Isolation (sandbox) plane.
-    pub isolation: PlaneState,
     /// Policy (ActPlane) plane.
     pub policy: PlaneState,
     /// Evidence (AgentSight) plane.
@@ -160,7 +158,6 @@ pub struct PlaneStatus {
 impl Default for PlaneStatus {
     fn default() -> Self {
         Self {
-            isolation: PlaneState::Disabled("not started".into()),
             policy: PlaneState::Disabled("not started".into()),
             evidence: PlaneState::Disabled("not started".into()),
             history: PlaneState::Disabled("not started".into()),
@@ -169,40 +166,35 @@ impl Default for PlaneStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Sandbox report (core-local; mirrors actime-sandbox without depending on it)
+// Target report — what Actime attached to
 // ---------------------------------------------------------------------------
 
-/// Snapshot of how a sandbox was configured for a run.
+/// Snapshot of the process tree Actime attached the planes to.
 ///
-/// Kept in `actime-core` (with `backend: String`) so this crate stays free of
-/// a dependency on `actime-sandbox`.
+/// Actime does not own sandboxes. The user brings an execution environment;
+/// this record describes the attach target (a launched command, a pid, a
+/// container that already exists, etc.).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SandboxReport {
-    /// Backend name (`docker`, `podman`, `bwrap`, `host`, …).
-    pub backend: String,
-    /// Sandbox / container name.
-    pub name: String,
-    /// Image used, when container-based.
-    pub image: Option<String>,
-    /// Host PID of the sandbox root process, if known.
+pub struct TargetReport {
+    /// `"command"` | `"pid"` | `"comm"` | `"container"` | `"pod"`.
+    pub kind: String,
+    /// What the user asked for (e.g. `"claude"`, `"4213"`, `"my-agent-box"`).
+    pub spec: Option<String>,
+    /// Host pid of the process tree root, when known.
     pub host_pid: Option<i32>,
-    /// Network mode applied.
-    pub network: NetworkMode,
-    /// Whether the isolation plane was actually active.
-    pub isolation: bool,
+    /// AgentSight `--binary-path` form when applicable (`docker://…`, `k8s://…`).
+    pub evidence_target: Option<String>,
     /// Optional human-readable note.
     pub note: Option<String>,
 }
 
-impl Default for SandboxReport {
+impl Default for TargetReport {
     fn default() -> Self {
         Self {
-            backend: "unknown".into(),
-            name: String::new(),
-            image: None,
+            kind: "command".into(),
+            spec: None,
             host_pid: None,
-            network: NetworkMode::Allow,
-            isolation: false,
+            evidence_target: None,
             note: None,
         }
     }
@@ -264,8 +256,8 @@ pub struct Manifest {
     pub cwd: PathBuf,
     /// Profile name used.
     pub profile: String,
-    /// Sandbox configuration snapshot.
-    pub sandbox: SandboxReport,
+    /// What the planes attached to for this run.
+    pub target: TargetReport,
     /// Which planes were active / degraded / disabled.
     pub planes: PlaneStatus,
     /// Component name → version.
@@ -290,15 +282,7 @@ impl Manifest {
             agent: detect_agent(argv),
             cwd,
             profile: cfg.profile.clone(),
-            sandbox: SandboxReport {
-                backend: cfg.sandbox.backend.clone(),
-                name: format!("actime-{id}"),
-                image: Some(cfg.sandbox.image.clone()),
-                host_pid: None,
-                network: cfg.sandbox.network,
-                isolation: false,
-                note: None,
-            },
+            target: TargetReport::default(),
             planes: PlaneStatus::default(),
             components: BTreeMap::new(),
             summary: RunSummary::default(),

@@ -1,8 +1,8 @@
 //! Core configuration, run store, evidence aggregation, and reporting for Actime.
 //!
-//! This crate is the integration contract for the Actime agent runtime
-//! (`docs/DESIGN.md` §5). It does **not** depend on `actime-sandbox`; the
-//! sandbox backend is represented as a plain [`String`] in [`SandboxConfig`].
+//! This crate is the integration contract for the Actime effect plane
+//! (`docs/DESIGN.md` §5). Actime does not manage sandboxes; it attaches policy,
+//! evidence, and history to an agent wherever it already runs.
 //!
 //! # Modules
 //!
@@ -40,14 +40,14 @@ pub mod run;
 pub use components::{compare_semver, extract_semver, Component, Components};
 pub use config::{
     format_duration, parse_duration, CliOverrides, Config, EvidenceConfig, HistoryConfig,
-    LimitsConfig, NetworkMode, PolicyConfig, PolicyMode, SandboxConfig,
+    LimitsConfig, PolicyConfig, PolicyMode,
 };
 pub use doctor::{run_checks, Check, CheckStatus};
 pub use evidence::{Evidence, TimelineEntry, Violation, TIMELINE_CAP};
 pub use report::{render_json, render_markdown, render_text};
 pub use run::{
     default_actime_home, detect_agent, Manifest, PlaneState, PlaneStatus, Run, RunId, RunStore,
-    RunSummary, SandboxReport,
+    RunSummary, TargetReport,
 };
 
 /// Crate version string.

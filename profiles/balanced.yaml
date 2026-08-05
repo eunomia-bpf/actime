@@ -6,11 +6,6 @@
 version: 1
 profile: balanced
 
-sandbox:
-  backend: auto
-  workdir: /workspace
-  network: allow
-
 policy:
   mode: enforce
   packs:

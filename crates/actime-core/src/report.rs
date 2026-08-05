@@ -42,10 +42,36 @@ pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
     let _ = writeln!(out, "  Profile:    {}", run.manifest.profile);
     let _ = writeln!(out);
 
+    // --- Target ---
+    let _ = writeln!(out, "Target");
+    let _ = writeln!(out, "{rule}");
+    let t = &run.manifest.target;
+    let _ = writeln!(out, "  kind:       {}", t.kind);
+    if let Some(ref spec) = t.spec {
+        let _ = writeln!(
+            out,
+            "  spec:       {}",
+            truncate(spec, width.saturating_sub(14))
+        );
+    }
+    if let Some(pid) = t.host_pid {
+        let _ = writeln!(out, "  host_pid:   {pid}");
+    }
+    if let Some(ref et) = t.evidence_target {
+        let _ = writeln!(out, "  evidence:   {et}");
+    }
+    if let Some(ref note) = t.note {
+        let _ = writeln!(
+            out,
+            "  note:       {}",
+            truncate(note, width.saturating_sub(14))
+        );
+    }
+    let _ = writeln!(out);
+
     // --- Planes ---
     let _ = writeln!(out, "Planes");
     let _ = writeln!(out, "{rule}");
-    render_plane_line(&mut out, "isolation", &run.manifest.planes.isolation, width);
     render_plane_line(&mut out, "policy", &run.manifest.planes.policy, width);
     render_plane_line(&mut out, "evidence", &run.manifest.planes.evidence, width);
     render_plane_line(&mut out, "history", &run.manifest.planes.history, width);
@@ -108,6 +134,26 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
     let _ = writeln!(out, "| Started | {} |", run.manifest.started_at);
     if let Some(ref ended) = run.manifest.ended_at {
         let _ = writeln!(out, "| Ended | {ended} |");
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Target");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| Field | Value |");
+    let _ = writeln!(out, "|-------|-------|");
+    let t = &run.manifest.target;
+    let _ = writeln!(out, "| Kind | {} |", escape_md(&t.kind));
+    if let Some(ref spec) = t.spec {
+        let _ = writeln!(out, "| Spec | `{}` |", escape_md(spec));
+    }
+    if let Some(pid) = t.host_pid {
+        let _ = writeln!(out, "| Host pid | {pid} |");
+    }
+    if let Some(ref et) = t.evidence_target {
+        let _ = writeln!(out, "| Evidence target | `{}` |", escape_md(et));
+    }
+    if let Some(ref note) = t.note {
+        let _ = writeln!(out, "| Note | {} |", escape_md(note));
     }
     let _ = writeln!(out);
 
@@ -279,9 +325,8 @@ fn render_violations_table(out: &mut String, violations: &[Violation], width: us
     }
 }
 
-fn plane_pairs(p: &PlaneStatus) -> [(&'static str, &PlaneState); 4] {
+fn plane_pairs(p: &PlaneStatus) -> [(&'static str, &PlaneState); 3] {
     [
-        ("isolation", &p.isolation),
         ("policy", &p.policy),
         ("evidence", &p.evidence),
         ("history", &p.history),
@@ -394,7 +439,8 @@ mod tests {
             .unwrap();
         run.manifest.exit_code = Some(0);
         run.manifest.summary.duration_seconds = 12.5;
-        run.manifest.planes.isolation = PlaneState::Active;
+        run.manifest.target.kind = "command".into();
+        run.manifest.target.spec = Some("claude".into());
         run.manifest.planes.policy = PlaneState::Degraded("CAP_BPF not available".into());
         run.manifest.planes.evidence = PlaneState::Disabled("agentsight not found".into());
         run.manifest.planes.history = PlaneState::Active;
@@ -449,7 +495,7 @@ mod tests {
         assert!(text.contains("Run id:"));
         assert!(text.contains("claude"));
         assert!(text.contains("Planes"));
-        assert!(text.contains("isolation"));
+        assert!(text.contains("Target"));
         assert!(text.contains("Active"));
         assert!(text.contains("Degraded"));
         assert!(text.contains("Summary"));

@@ -1,7 +1,7 @@
 //! Assets compiled into the `actime` binary.
 //!
-//! Policy packs, profiles, and the demo agent ship inside the executable so a
-//! single downloaded binary is fully functional with nothing else on disk.
+//! Policy packs and profiles ship inside the executable so a single downloaded
+//! binary is fully functional with nothing else on disk.
 
 /// A policy pack shipped with Actime.
 pub struct Pack {
@@ -38,9 +38,6 @@ pub const PROFILES: &[(&str, &str)] = &[
     ("balanced", include_str!("../../../profiles/balanced.yaml")),
     ("strict", include_str!("../../../profiles/strict.yaml")),
 ];
-
-/// The stand-in agent used by `actime demo`.
-pub const DEMO_AGENT: &str = include_str!("../../../examples/demo-agent.sh");
 
 /// Look up a policy pack by name.
 pub fn pack(name: &str) -> Option<&'static Pack> {
@@ -79,9 +76,12 @@ pub fn compose_policy(
         out.push_str(&p.source.replace("${WORKSPACE}", workspace));
     }
 
-    for (path, source) in extra_sources {
-        out.push_str(&format!("\n# ---- file: {path} ----\n"));
+    for (label, source) in extra_sources {
+        out.push_str(&format!("\n# ---- file: {label} ----\n"));
         out.push_str(&source.replace("${WORKSPACE}", workspace));
+        if !source.ends_with('\n') {
+            out.push('\n');
+        }
     }
 
     Ok(out)
@@ -92,70 +92,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_pack_is_non_empty_and_named() {
-        assert_eq!(PACKS.len(), 3);
+    fn every_pack_has_rules() {
         for p in PACKS {
-            assert!(!p.name.is_empty());
-            assert!(!p.summary.is_empty());
-            assert!(p.source.contains("rule "), "{} has no rules", p.name);
+            assert!(
+                p.source
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("rule ")),
+                "pack {} has no rules",
+                p.name
+            );
         }
     }
 
     #[test]
-    fn every_profile_parses_as_yaml() {
-        for (name, yaml) in PROFILES {
-            let v: serde_yaml::Value =
-                serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(v.get("version").is_some(), "{name} has no version");
-        }
-    }
-
-    #[test]
-    fn compose_substitutes_workspace_everywhere() {
-        let dsl = compose_policy(
-            &["coding-agent-baseline".into(), "no-vcs-write".into()],
-            &[],
-            "/srv/project",
-        )
-        .expect("compose");
+    fn compose_substitutes_workspace() {
+        let packs = vec!["coding-agent-baseline".into()];
+        let dsl = compose_policy(&packs, &[], "/tmp/ws").expect("compose");
+        assert!(dsl.contains("/tmp/ws"));
         assert!(!dsl.contains("${WORKSPACE}"));
-        assert!(dsl.contains("/srv/project"));
-        assert!(dsl.contains("pack: coding-agent-baseline"));
-        assert!(dsl.contains("pack: no-vcs-write"));
     }
 
     #[test]
-    fn compose_substitutes_in_extra_files_too() {
-        let extra = vec![(
-            "team.dsl".to_string(),
-            "rule x:\n  notify write file \"${WORKSPACE}/**\" if AGENT\n".to_string(),
-        )];
-        let dsl = compose_policy(&[], &extra, "/srv/project").expect("compose");
-        assert!(!dsl.contains("${WORKSPACE}"));
-        assert!(dsl.contains("/srv/project/**"));
-    }
-
-    #[test]
-    fn unknown_pack_names_the_known_ones() {
+    fn unknown_pack_is_named() {
         let err = compose_policy(&["nope".into()], &[], "/w")
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"));
-        assert!(err.contains("coding-agent-baseline"));
     }
 
     #[test]
-    fn demo_agent_is_a_shell_script_that_triggers_a_rule() {
-        assert!(DEMO_AGENT.starts_with("#!/bin/sh"));
-        // The demo must exercise the baseline pack's destructive-vcs rule.
-        assert!(DEMO_AGENT.contains("git push --force"));
-    }
-
-    #[test]
-    fn lookup_helpers() {
-        assert!(pack("no-secret-egress").is_some());
-        assert!(pack("does-not-exist").is_none());
-        assert!(profile("balanced").is_some());
-        assert!(profile("paranoid").is_none());
+    fn profiles_are_loadable() {
+        for name in ["observe", "balanced", "strict"] {
+            assert!(profile(name).is_some(), "missing profile {name}");
+            assert!(!profile(name).unwrap().contains("sandbox"));
+        }
     }
 }

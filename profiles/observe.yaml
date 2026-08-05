@@ -7,11 +7,6 @@
 version: 1
 profile: observe
 
-sandbox:
-  backend: auto
-  workdir: /workspace
-  network: allow
-
 policy:
   mode: observe
   packs:

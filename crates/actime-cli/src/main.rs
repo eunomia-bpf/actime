@@ -1,8 +1,8 @@
 //! The `actime` binary.
 //!
-//! Actime runs an unmodified AI coding agent inside a sandbox and wraps it in
-//! four planes: isolation, policy, evidence, and history. See `docs/DESIGN.md`
-//! sections 7 and 10 for the orchestration sequence and the command surface.
+//! Actime is the effect plane for AI coding agents: policy, evidence, and
+//! history attached to an agent wherever it already runs. Bring your own
+//! sandbox. See `docs/DESIGN.md`.
 
 mod commands;
 mod embedded;
@@ -22,21 +22,20 @@ pub const EXIT_VIOLATION: i32 = 3;
 #[command(
     name = "actime",
     version,
-    about = "Unified runtime for AI coding agents: sandbox isolation, kernel policy, system evidence, and session history",
+    about = "Effect plane for AI coding agents: kernel policy, system evidence, and session history. Bring your own sandbox.",
     long_about = None,
     after_help = "EXAMPLES:\n  \
-      # see the whole pipeline in 30 seconds, with no agent and no root\n  \
-      actime demo\n\n  \
       # check what your machine supports\n  \
       actime doctor\n\n  \
-      # run your agent with the default (balanced) profile\n  \
+      # run your agent under the three planes (host process tree)\n  \
       actime run -- claude\n\n  \
       # learn first: record everything, block nothing\n  \
       actime run --policy observe -- codex\n\n  \
-      # no container runtime on this box; keep the other three planes\n  \
-      actime run --sandbox host -- claude\n\n  \
-      # an agent that is already running\n  \
-      actime attach --comm claude\n\n  \
+      # attach to something already running\n  \
+      actime attach --comm claude\n  \
+      actime attach --pid 4213\n  \
+      actime attach --container my-agent-box\n  \
+      actime attach --pod default/agent-0\n\n  \
       # read the record\n  \
       actime report            # the latest run\n  \
       actime report --json     # for a SIEM\n\n\
@@ -65,13 +64,10 @@ enum Commands {
     /// Write a starter actime.yaml for this project.
     Init(InitArgs),
 
-    /// Run an agent under the full runtime.
+    /// Run an agent as a host child and attach the three planes.
     Run(RunArgs),
 
-    /// Open an interactive shell inside the sandbox.
-    Shell(ShellArgs),
-
-    /// Attach the policy and evidence planes to an already-running agent.
+    /// Attach the planes to something already running.
     Attach(AttachArgs),
 
     /// Show runs that are currently in progress.
@@ -95,17 +91,8 @@ enum Commands {
         command: KeepCommands,
     },
 
-    /// Inspect and prepare the sandbox image.
-    Sandbox {
-        #[command(subcommand)]
-        command: SandboxCommands,
-    },
-
     /// Diagnose which planes this machine supports.
     Doctor(DoctorArgs),
-
-    /// Run a bundled stand-in agent end to end. No agent or root required.
-    Demo(DemoArgs),
 }
 
 #[derive(Args)]
@@ -120,17 +107,9 @@ struct InitArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Sandbox backend: auto, docker, podman, bwrap, or host.
-    #[arg(long, value_name = "BACKEND")]
-    sandbox: Option<String>,
-
     /// Policy mode: off, observe, or enforce.
     #[arg(long, value_name = "MODE")]
     policy: Option<String>,
-
-    /// Sandbox image to run the agent in.
-    #[arg(long, value_name = "IMAGE")]
-    image: Option<String>,
 
     /// Turn off the evidence plane for this run.
     #[arg(long)]
@@ -154,23 +133,25 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct ShellArgs {
-    /// Sandbox backend: auto, docker, podman, bwrap, or host.
-    #[arg(long, value_name = "BACKEND")]
-    sandbox: Option<String>,
-    /// Sandbox image to use.
-    #[arg(long, value_name = "IMAGE")]
-    image: Option<String>,
-}
-
-#[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("target")
+        .required(true)
+        .multiple(false)
+        .args(["pid", "comm", "container", "pod"])
+))]
 struct AttachArgs {
-    /// Pid of the already-running agent.
-    #[arg(long, conflicts_with = "comm")]
+    /// Host pid of an already-running agent.
+    #[arg(long)]
     pid: Option<i32>,
-    /// Command name of the already-running agent, e.g. claude.
-    #[arg(short, long, conflicts_with = "pid")]
+    /// Command name of an already-running agent, e.g. claude.
+    #[arg(short, long)]
     comm: Option<String>,
+    /// Existing Docker/Podman container name or id (must already be running).
+    #[arg(long, value_name = "NAME|ID")]
+    container: Option<String>,
+    /// Existing Kubernetes pod on this node as namespace/name.
+    #[arg(long, value_name = "NS/POD")]
+    pod: Option<String>,
     /// Policy mode: off, observe, or enforce.
     #[arg(long, value_name = "MODE")]
     policy: Option<String>,
@@ -235,35 +216,11 @@ enum KeepCommands {
     },
 }
 
-#[derive(Subcommand)]
-enum SandboxCommands {
-    /// Show which backends are available and why the others are not.
-    Info,
-    /// Build the sandbox image from sandbox/Dockerfile.
-    Build {
-        /// Tag to build.
-        #[arg(long)]
-        tag: Option<String>,
-    },
-    /// Pull the published sandbox image.
-    Pull,
-}
-
 #[derive(Args)]
 struct DoctorArgs {
     /// Emit JSON.
     #[arg(long)]
     json: bool,
-}
-
-#[derive(Args)]
-struct DemoArgs {
-    /// Sandbox backend: auto, docker, podman, bwrap, or host.
-    #[arg(long, value_name = "BACKEND")]
-    sandbox: Option<String>,
-    /// Policy mode: off, observe, or enforce.
-    #[arg(long, value_name = "MODE", default_value = "enforce")]
-    policy: String,
 }
 
 fn main() {
@@ -280,17 +237,23 @@ fn main() {
             &ctx,
             run::RunRequest {
                 argv: a.cmd,
-                sandbox: a.sandbox,
                 policy: a.policy,
-                image: a.image,
                 no_evidence: a.no_evidence,
                 no_history: a.no_history,
                 fail_on_violation: a.fail_on_violation,
                 timeout: a.timeout,
             },
         ),
-        Commands::Shell(a) => run::shell(&ctx, a.sandbox, a.image),
-        Commands::Attach(a) => run::attach(&ctx, a.pid, a.comm, a.policy),
+        Commands::Attach(a) => run::attach(
+            &ctx,
+            run::AttachRequest {
+                pid: a.pid,
+                comm: a.comm,
+                container: a.container,
+                pod: a.pod,
+                policy: a.policy,
+            },
+        ),
         Commands::Status => commands::status(&ctx),
         Commands::Runs(a) => commands::runs(&ctx, a.json, a.limit),
         Commands::Report(a) => commands::report(&ctx, &a.run, a.json, a.markdown),
@@ -305,13 +268,7 @@ fn main() {
             KeepCommands::Log => commands::keep_log(),
             KeepCommands::Restore { run, to } => commands::keep_restore(&ctx, &run, to),
         },
-        Commands::Sandbox { command } => match command {
-            SandboxCommands::Info => commands::sandbox_info(),
-            SandboxCommands::Build { tag } => commands::sandbox_build(&ctx, tag),
-            SandboxCommands::Pull => commands::sandbox_pull(&ctx),
-        },
         Commands::Doctor(a) => commands::doctor(&ctx, a.json),
-        Commands::Demo(a) => run::demo(&ctx, a.sandbox, &a.policy),
     };
 
     match result {
@@ -348,10 +305,9 @@ mod tests {
         let cli = Cli::try_parse_from([
             "actime",
             "run",
-            "--sandbox",
-            "host",
             "--policy",
             "observe",
+            "--no-history",
             "--",
             "echo",
             "hi",
@@ -359,8 +315,8 @@ mod tests {
         .expect("parse");
         match cli.command {
             Commands::Run(a) => {
-                assert_eq!(a.sandbox.as_deref(), Some("host"));
                 assert_eq!(a.policy.as_deref(), Some("observe"));
+                assert!(a.no_history);
                 assert_eq!(a.cmd, vec!["echo", "hi"]);
             }
             _ => panic!("expected run"),
@@ -368,7 +324,24 @@ mod tests {
     }
 
     #[test]
-    fn attach_rejects_pid_and_comm_together() {
+    fn attach_accepts_each_target_kind() {
+        for args in [
+            vec!["actime", "attach", "--pid", "1"],
+            vec!["actime", "attach", "--comm", "claude"],
+            vec!["actime", "attach", "--container", "box"],
+            vec!["actime", "attach", "--pod", "ns/pod"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn attach_requires_a_target() {
+        assert!(Cli::try_parse_from(["actime", "attach"]).is_err());
+    }
+
+    #[test]
+    fn attach_rejects_multiple_targets() {
         assert!(
             Cli::try_parse_from(["actime", "attach", "--pid", "1", "--comm", "claude"]).is_err()
         );
@@ -397,5 +370,12 @@ mod tests {
     #[test]
     fn run_requires_a_command() {
         assert!(Cli::try_parse_from(["actime", "run"]).is_err());
+    }
+
+    #[test]
+    fn demo_and_sandbox_are_gone() {
+        assert!(Cli::try_parse_from(["actime", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["actime", "sandbox", "info"]).is_err());
+        assert!(Cli::try_parse_from(["actime", "shell"]).is_err());
     }
 }

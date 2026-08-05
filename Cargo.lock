@@ -7,7 +7,6 @@ name = "actime"
 version = "0.1.0"
 dependencies = [
  "actime-core",
- "actime-sandbox",
  "anyhow",
  "chrono",
  "clap",
@@ -31,17 +30,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
-]
-
-[[package]]
-name = "actime-sandbox"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

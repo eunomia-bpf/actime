@@ -1,13 +1,10 @@
-//! `actime run`, `shell`, `attach`, and `demo` — the orchestration sequence.
+//! `actime run` and `actime attach` — attach the three planes to a process tree.
 //!
-//! See `docs/DESIGN.md` section 7. The ordering matters: the sandbox is brought
-//! up *before* the agent exists so the policy and evidence planes can attach to
-//! its process tree first. Everything is fail-soft except `policy.mode:
-//! enforce`, which aborts the run when the policy plane cannot load.
+//! Actime never creates, starts, stops, or removes a container. `run` launches
+//! the agent as a plain host child; `attach` binds to something already running
+//! (pid, comm, existing container, or existing pod). See `docs/DESIGN.md`.
 
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,9 +12,8 @@ use anyhow::{bail, Context, Result};
 
 use actime_core::config::{CliOverrides, Config, PolicyMode};
 use actime_core::evidence::Evidence;
-use actime_core::run::{PlaneState, Run, RunStore};
+use actime_core::run::{PlaneState, Run, RunStore, TargetReport};
 use actime_core::{components::Components, report};
-use actime_sandbox::{Backend, Mount, NetworkMode, Sandbox, SandboxSpec};
 
 use crate::commands::Context as Ctx;
 use crate::embedded;
@@ -30,12 +26,8 @@ use crate::ui;
 pub struct RunRequest {
     /// The agent command and its arguments.
     pub argv: Vec<String>,
-    /// `--sandbox`.
-    pub sandbox: Option<String>,
     /// `--policy`.
     pub policy: Option<String>,
-    /// `--image`.
-    pub image: Option<String>,
     /// `--no-evidence`.
     pub no_evidence: bool,
     /// `--no-history`.
@@ -46,13 +38,26 @@ pub struct RunRequest {
     pub timeout: Option<String>,
 }
 
-/// Run an agent under the full runtime. Returns the process exit code.
+/// Everything `actime attach` accepts from the command line.
+pub struct AttachRequest {
+    /// `--pid`.
+    pub pid: Option<i32>,
+    /// `--comm`.
+    pub comm: Option<String>,
+    /// `--container` (existing Docker/Podman name or id).
+    pub container: Option<String>,
+    /// `--pod` as `namespace/name`.
+    pub pod: Option<String>,
+    /// `--policy`.
+    pub policy: Option<String>,
+}
+
+/// Run an agent as a host child and attach the three planes.
 pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving the current directory")?;
     let mut cfg = ctx.load_config(&cwd)?;
 
     cfg.merge_cli(&CliOverrides {
-        sandbox_backend: req.sandbox.clone(),
         policy_mode: match req.policy.as_deref() {
             Some(m) => Some(
                 m.parse::<PolicyMode>()
@@ -64,9 +69,6 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
         no_evidence: req.no_evidence.then_some(true),
         no_history: req.no_history.then_some(true),
     });
-    if let Some(image) = &req.image {
-        cfg.sandbox.image = image.clone();
-    }
     if let Some(t) = &req.timeout {
         cfg.limits.wall_clock = Some(
             actime_core::config::parse_duration(t)
@@ -74,11 +76,12 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
         );
     }
 
+    if req.argv.is_empty() {
+        bail!("a command is required after `--`");
+    }
+
     let components = Components::detect();
     let store = RunStore::open_default()?;
-    // `create` snapshots the fully merged config next to the manifest, so even
-    // a run that dies during setup leaves behind exactly what it was asked to
-    // do.
     let mut run = store.create(&req.argv, &cfg)?;
 
     for c in components.iter() {
@@ -89,10 +92,16 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
         }
     }
 
-    let outcome = orchestrate(ctx, &mut run, &cfg, &components, &req, &cwd);
+    run.manifest.target = TargetReport {
+        kind: "command".into(),
+        spec: Some(req.argv.join(" ")),
+        host_pid: None,
+        evidence_target: None,
+        note: Some("launched as a host child process".into()),
+    };
 
-    // The exit path is unconditional: whatever happened above, the manifest and
-    // the report are written.
+    let outcome = orchestrate_run(ctx, &mut run, &cfg, &components, &req, &cwd);
+
     let exit = match outcome {
         Ok(exit) => exit,
         Err(e) => {
@@ -105,63 +114,42 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
     finish(ctx, &mut run, exit, req.fail_on_violation)
 }
 
-/// The part of a run that can fail. Planes are torn down on every path.
-fn orchestrate(
-    ctx: &Ctx,
-    run: &mut Run,
-    cfg: &Config,
-    components: &Components,
-    req: &RunRequest,
-    cwd: &Path,
-) -> Result<i32> {
-    let backend = resolve_backend(cfg)?;
-    let spec = build_spec(cfg, run, cwd, backend)?;
-    let isolation_note = spec_note(backend);
-
-    let mut sandbox = actime_sandbox::create(backend, spec)
-        .with_context(|| format!("creating the {} sandbox", backend.as_str()))?;
-
-    // Step 3: bring the sandbox up with no agent in it, so the planes can
-    // attach to a process tree that has not run any agent code yet.
-    if let Err(e) = sandbox.start() {
-        let _ = sandbox.cleanup();
-        return Err(e).with_context(|| format!("starting the {} sandbox", backend.as_str()));
+/// Attach the planes to an already-running process tree.
+pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    let mut cfg = ctx.load_config(&cwd)?;
+    if let Some(mode) = &req.policy {
+        cfg.policy.mode = mode.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    let host_pid = sandbox.host_pid();
-    let evidence_target = sandbox.evidence_target();
-    let sb_report = sandbox.report();
-    run.manifest.sandbox.backend = backend.as_str().to_string();
-    run.manifest.sandbox.name = sb_report.name.clone();
-    run.manifest.sandbox.host_pid = host_pid;
-    run.manifest.sandbox.isolation = backend != Backend::Host;
-    run.manifest.sandbox.note = isolation_note;
-    run.manifest.planes.isolation = if backend == Backend::Host {
-        PlaneState::Degraded("host mode: no isolation".into())
-    } else {
-        PlaneState::Active
+    let resolved = resolve_attach_target(&req)?;
+    let components = Components::detect();
+    let store = RunStore::open_default()?;
+    let argv = vec![format!("attach:{}", resolved.label)];
+    let mut run = store.create(&argv, &cfg)?;
+
+    for c in components.iter() {
+        if let Some(v) = &c.version {
+            run.manifest
+                .components
+                .insert(c.name.to_string(), v.clone());
+        }
+    }
+
+    run.manifest.target = TargetReport {
+        kind: resolved.kind.clone(),
+        spec: Some(resolved.label.clone()),
+        host_pid: Some(resolved.host_pid),
+        evidence_target: resolved.evidence_target.clone(),
+        note: Some("attached to an already-running process tree; Actime did not create it".into()),
     };
 
-    // The workspace path as the *agent* sees it. Policy files are written once,
-    // against this path, so the same policy works inside and outside a sandbox.
-    let workspace = match backend {
-        Backend::Docker | Backend::Podman => cfg.sandbox.workdir.clone(),
-        Backend::Bwrap | Backend::Host => cwd.display().to_string(),
-    };
-
-    // Step 4: the policy plane.
-    // Host mode uses `actplane run` (wrap) per DESIGN.md §7; containers attach.
-    let wrap_host = backend == Backend::Host && cfg.policy.mode != PolicyMode::Off;
-    let dsl = compose(cfg, &workspace)?;
-    let packs = if cfg.policy.packs.is_empty() {
-        "custom".to_string()
-    } else {
-        cfg.policy.packs.join(", ")
-    };
-    // ActPlane `run` scopes feedback under parent(feedback)/runs/<id>/. Keep
-    // that subtree under actplane/ so the rest of the run dir stays clean and
-    // harvest knows where to look (see DESIGN.md §5).
+    let workspace = cwd.display().to_string();
+    let dsl = compose(&cfg, &workspace)?;
+    let packs = packs_label(&cfg);
     let actplane_dir = run.dir.join("actplane");
+    let _ = std::fs::create_dir_all(&actplane_dir);
+
     let mut policy = PolicyPlane::start(PolicyPlaneSpec {
         binary: components.actplane.path.as_deref(),
         version: components.actplane.version.as_deref(),
@@ -172,48 +160,49 @@ fn orchestrate(
         violations: run.violations_path(),
         feedback: actplane_dir.join("feedback.txt"),
         audit: actplane_dir.join("audit.jsonl"),
-        host_pid,
-        wrap_command: wrap_host,
+        host_pid: Some(resolved.host_pid),
+        wrap_command: false,
         feedback_enabled: cfg.policy.feedback,
         log: run.dir.join("policy-engine.log"),
     });
 
-    // Fail closed: `enforce` means enforce, or do not run at all.
     if cfg.policy.mode == PolicyMode::Enforce && !policy.outcome.is_active() {
         policy.stop();
-        let _ = sandbox.cleanup();
         run.manifest.planes.policy = PlaneState::Disabled(policy.outcome.detail().to_string());
         bail!(
             "policy.mode is `enforce` but the policy plane could not start: {}\n\
              \n\
-             Actime fails closed rather than running an agent unprotected.\n\
+             Actime fails closed rather than attaching unprotected.\n\
              Fix one of:\n\
-               • re-run with privileges:  sudo actime run --policy enforce -- <agent>\n\
-               • learn first without blocking:  actime run --policy observe -- <agent>\n\
+               • re-run with privileges:  sudo actime attach --pid {}\n\
+               • learn first without blocking:  actime attach --policy observe --pid {}\n\
                • diagnose this machine:  actime doctor",
-            policy.outcome.detail()
+            policy.outcome.detail(),
+            resolved.host_pid,
+            resolved.host_pid
         );
     }
     run.manifest.planes.policy = to_plane_state(&policy.outcome);
 
-    // Step 5: the evidence plane. Always fail-soft.
     let mut evidence = EvidencePlane::start(EvidencePlaneSpec {
         binary: components.agentsight.path.as_deref(),
         version: components.agentsight.version.as_deref(),
         enabled: cfg.evidence.enabled,
-        target: evidence_target,
-        host_pid,
+        target: resolved.evidence_target.clone(),
+        host_pid: Some(resolved.host_pid),
         db: run.evidence_db_path(),
         log: run.dir.join("evidence-engine.log"),
     });
     run.manifest.planes.evidence = to_plane_state(&evidence.outcome);
+    run.manifest.planes.history = PlaneState::Disabled("attach does not commit history".into());
+    let _ = run.save_manifest();
 
     if !ctx.quiet {
         eprintln!(
             "{}",
             ui::banner(
                 run.id.as_str(),
-                backend.as_str(),
+                &format!("{} {}", resolved.kind, resolved.label),
                 &cfg.policy.mode.to_string(),
                 if evidence.outcome.is_active() {
                     "on"
@@ -234,66 +223,195 @@ fn orchestrate(
                 );
             }
         }
+        eprintln!(
+            "{}",
+            ui::note(
+                "attach binds future events from this process tree; it cannot reconstruct \
+                 what happened before now. Press Ctrl-C to detach."
+            )
+        );
+        eprintln!();
+    }
+
+    let started = Instant::now();
+    while process_is_alive(resolved.host_pid) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Engines must exit fully before harvest so events flush to disk.
+    policy.stop();
+    evidence.stop();
+    harvest_actplane_events(&run);
+
+    run.manifest.summary.duration_seconds = started.elapsed().as_secs_f64();
+    finish(ctx, &mut run, 0, false)
+}
+
+// ---------------------------------------------------------------------------
+// run orchestration
+// ---------------------------------------------------------------------------
+
+fn orchestrate_run(
+    ctx: &Ctx,
+    run: &mut Run,
+    cfg: &Config,
+    components: &Components,
+    req: &RunRequest,
+    cwd: &Path,
+) -> Result<i32> {
+    // Policy is composed against the real host workspace: the agent runs in the
+    // user's cwd, not a guest mount path.
+    let workspace = cwd.display().to_string();
+    let dsl = compose(cfg, &workspace)?;
+    let packs = packs_label(cfg);
+    let actplane_dir = run.dir.join("actplane");
+    let _ = std::fs::create_dir_all(&actplane_dir);
+
+    // Host launch always uses actplane wrap when policy is on: attach-after-spawn
+    // races short agents. Wrap is launch-time enforcement.
+    let wrap_policy = cfg.policy.mode != PolicyMode::Off;
+    let mut policy = PolicyPlane::start(PolicyPlaneSpec {
+        binary: components.actplane.path.as_deref(),
+        version: components.actplane.version.as_deref(),
+        mode: &cfg.policy.mode.to_string(),
+        dsl: &dsl,
+        packs: &packs,
+        policy_yaml: run.policy_path(),
+        violations: run.violations_path(),
+        feedback: actplane_dir.join("feedback.txt"),
+        audit: actplane_dir.join("audit.jsonl"),
+        host_pid: None,
+        wrap_command: wrap_policy,
+        feedback_enabled: cfg.policy.feedback,
+        log: run.dir.join("policy-engine.log"),
+    });
+
+    if cfg.policy.mode == PolicyMode::Enforce && !policy.outcome.is_active() {
+        policy.stop();
+        run.manifest.planes.policy = PlaneState::Disabled(policy.outcome.detail().to_string());
+        bail!(
+            "policy.mode is `enforce` but the policy plane could not start: {}\n\
+             \n\
+             Actime fails closed rather than running an agent unprotected.\n\
+             Fix one of:\n\
+               • re-run with privileges:  sudo actime run --policy enforce -- <agent>\n\
+               • learn first without blocking:  actime run --policy observe -- <agent>\n\
+               • diagnose this machine:  actime doctor",
+            policy.outcome.detail()
+        );
+    }
+    run.manifest.planes.policy = to_plane_state(&policy.outcome);
+
+    // Evidence attaches after the child exists. For wrap, that is the wrap pid;
+    // for plain spawn, the agent pid. Started once we know the pid.
+    let mut evidence: Option<EvidencePlane> = None;
+
+    if !ctx.quiet {
+        eprintln!(
+            "{}",
+            ui::banner(
+                run.id.as_str(),
+                "command",
+                &cfg.policy.mode.to_string(),
+                if cfg.evidence.enabled { "on" } else { "off" },
+            )
+        );
+        if !policy.outcome.is_active() {
+            eprintln!(
+                "{}",
+                ui::warn(&format!(
+                    "policy plane {}: {}",
+                    policy.outcome.label(),
+                    policy.outcome.detail()
+                ))
+            );
+        }
         eprintln!();
     }
 
     let _ = run.save_manifest();
-
-    // Step 6: the agent.
-    // Host + active policy → wrap with `actplane run` so enforcement is real.
-    // Host wrap uses a dedicated waiter (not Sandbox::wait alone) because
-    // actplane 0.1.8 often outlives the agent.
     let started = Instant::now();
-    let exit = if wrap_host && policy.outcome.is_active() {
-        match components.actplane.path.as_deref() {
-            Some(bin) => run_host_policy_wrap(
-                bin,
-                &run.policy_path(),
-                &req.argv,
-                &run.dir.join("policy-engine.log"),
-                cfg.limits.wall_clock,
-                ctx.quiet,
-            ),
-            None => {
-                // Should be unreachable: PolicyPlane::start would have disabled.
-                let spawn_result = sandbox.spawn(&req.argv);
-                match spawn_result {
-                    Ok(()) => {
-                        wait_for_agent(sandbox.as_mut(), cfg.limits.wall_clock, ctx.quiet, false)
-                    }
-                    Err(e) => Err(e),
+
+    let exit = if wrap_policy && policy.outcome.is_active() {
+        let Some(bin) = components.actplane.path.as_deref() else {
+            bail!("actplane disappeared after policy plane start");
+        };
+        let (code, wrap_pid) = run_host_policy_wrap(
+            bin,
+            &run.policy_path(),
+            &req.argv,
+            &run.dir.join("policy-engine.log"),
+            cfg.limits.wall_clock,
+            ctx.quiet,
+            |wrap_pid| {
+                // Attach evidence to the wrap tree as soon as it exists.
+                if evidence.is_none() && cfg.evidence.enabled {
+                    let plane = EvidencePlane::start(EvidencePlaneSpec {
+                        binary: components.agentsight.path.as_deref(),
+                        version: components.agentsight.version.as_deref(),
+                        enabled: true,
+                        target: None,
+                        host_pid: Some(wrap_pid),
+                        db: run.evidence_db_path(),
+                        log: run.dir.join("evidence-engine.log"),
+                    });
+                    run.manifest.planes.evidence = to_plane_state(&plane.outcome);
+                    run.manifest.target.host_pid = Some(wrap_pid);
+                    evidence = Some(plane);
                 }
-            }
-        }
+            },
+        )?;
+        run.manifest.target.host_pid = Some(wrap_pid);
+        code
     } else {
-        let spawn_result = sandbox.spawn(&req.argv);
-        match spawn_result {
-            Ok(()) => wait_for_agent(sandbox.as_mut(), cfg.limits.wall_clock, ctx.quiet, false),
-            Err(e) => Err(e),
-        }
+        // Plain child: no policy wrap.
+        let (code, agent_pid) =
+            run_plain_child(&req.argv, cfg.limits.wall_clock, ctx.quiet, |agent_pid| {
+                run.manifest.target.host_pid = Some(agent_pid);
+                if evidence.is_none() {
+                    let plane = EvidencePlane::start(EvidencePlaneSpec {
+                        binary: components.agentsight.path.as_deref(),
+                        version: components.agentsight.version.as_deref(),
+                        enabled: cfg.evidence.enabled,
+                        target: None,
+                        host_pid: Some(agent_pid),
+                        db: run.evidence_db_path(),
+                        log: run.dir.join("evidence-engine.log"),
+                    });
+                    run.manifest.planes.evidence = to_plane_state(&plane.outcome);
+                    evidence = Some(plane);
+                }
+            })?;
+        run.manifest.target.host_pid = Some(agent_pid);
+        code
     };
 
+    // Policy wrap owns the actplane process; PolicyPlane has no child in wrap
+    // mode. For attach-style (not used in run wrap path), stop the attach child.
+    let policy_was_active = policy.outcome.is_active();
     policy.stop();
-    evidence.stop();
-    // Give agentsight a moment to flush WAL into evidence.db after SIGTERM.
-    if matches!(
-        run.manifest.planes.evidence,
-        PlaneState::Active | PlaneState::Degraded(_)
-    ) {
-        std::thread::sleep(Duration::from_millis(300));
+    if let Some(mut ev) = evidence.take() {
+        let evidence_was_active = ev.outcome.is_active();
+        ev.stop();
+        // Brief settle so agentsight can finish WAL after SIGTERM.
+        if evidence_was_active {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    } else {
+        run.manifest.planes.evidence = PlaneState::Disabled(if cfg.evidence.enabled {
+            "evidence plane was not started".into()
+        } else {
+            "evidence.enabled is false".into()
+        });
     }
-    let _ = sandbox.cleanup();
 
-    // ActPlane `run` scopes events under actplane/runs/<id>/events.jsonl.
-    // Harvest them into the run's violations.jsonl so the report sees them.
-    harvest_actplane_events(run);
+    // Harvest only after engines have fully exited (stop waits for that).
+    if policy_was_active || cfg.policy.mode != PolicyMode::Off {
+        harvest_actplane_events(run);
+    }
 
     run.manifest.summary.duration_seconds = started.elapsed().as_secs_f64();
 
-    let exit = exit.with_context(|| format!("running `{}`", req.argv.join(" ")))?;
-
-    // Step 7: the history plane, after the agent has written its session files.
-    // Bound is already inside HistoryPlane; demo must not hang here either.
     let message = cfg
         .history
         .message
@@ -311,268 +429,27 @@ fn orchestrate(
     Ok(exit)
 }
 
-/// Copy ActPlane-scoped event files into the run's `violations.jsonl`.
+// ---------------------------------------------------------------------------
+// host launch helpers
+// ---------------------------------------------------------------------------
+
+/// Launch the agent under `actplane run` and wait with a graceful flush window.
 ///
-/// ActPlane 0.1.x `run` always rewrites feedback paths via
-/// `scoped_feedback_paths`: events land under
-/// `actplane/runs/run-<pid>-<ts>/events.jsonl`, not at the `events:` path in
-/// policy.yaml. We also accept the older layout `runs/` at the run root.
-fn harvest_actplane_events(run: &Run) {
-    let mut collected = String::new();
-    for root in [run.dir.join("actplane").join("runs"), run.dir.join("runs")] {
-        append_events_from_run_tree(&root, &mut collected);
-    }
-    // Fallback: synthesize a violation line from feedback.txt or console kill
-    // banners if the JSONL event file was empty (flush race / domain filter).
-    if collected.is_empty() {
-        for root in [
-            run.dir.join("actplane").join("runs"),
-            run.dir.join("runs"),
-            run.dir.join("actplane"),
-            run.dir.clone(),
-        ] {
-            if let Some(line) = synthesize_violation_from_feedback_tree(&root) {
-                collected.push_str(&line);
-                collected.push('\n');
-                break;
-            }
-        }
-    }
-    if collected.is_empty() {
-        // Last resort: policy-engine.log / any *.log under the run may have the
-        // "🚫 KILLED" banner ActPlane prints to stderr.
-        if let Some(line) = synthesize_violation_from_kill_banner(&run.dir) {
-            collected.push_str(&line);
-            collected.push('\n');
-        }
-    }
-    if collected.is_empty() {
-        return;
-    }
-    let dest = run.violations_path();
-    let mut existing = std::fs::read_to_string(&dest).unwrap_or_default();
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        existing.push('\n');
-    }
-    existing.push_str(&collected);
-    let _ = std::fs::write(&dest, existing);
-}
-
-fn append_events_from_run_tree(runs_root: &Path, collected: &mut String) {
-    let Ok(entries) = std::fs::read_dir(runs_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let events = entry.path().join("events.jsonl");
-        if let Ok(text) = std::fs::read_to_string(&events) {
-            if !text.trim().is_empty() {
-                collected.push_str(text.trim_end());
-                collected.push('\n');
-            }
-        }
-        // Also accept events.jsonl directly under a leaf (not only one level deep).
-        let direct = entry.path();
-        if direct.file_name().is_some_and(|n| n == "events.jsonl") {
-            if let Ok(text) = std::fs::read_to_string(&direct) {
-                if !text.trim().is_empty() {
-                    collected.push_str(text.trim_end());
-                    collected.push('\n');
-                }
-            }
-        }
-    }
-}
-
-/// Best-effort parse of ActPlane feedback.txt into one violations.jsonl line.
-fn synthesize_violation_from_feedback_tree(root: &Path) -> Option<String> {
-    // Walk one or two levels for feedback.txt.
-    let mut candidates = vec![root.join("feedback.txt")];
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for e in entries.flatten() {
-            candidates.push(e.path().join("feedback.txt"));
-        }
-    }
-    for path in candidates {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some(line) = parse_feedback_kill(&text) {
-                return Some(line);
-            }
-        }
-    }
-    None
-}
-
-/// Parse ActPlane's human feedback block into a minimal JSON violation.
-///
-/// Example text:
-/// ```text
-/// [ActPlane] Operation killed by rule `destructive-vcs`.
-/// - Target operation: exec /usr/bin/git
-/// - Reason: Force-pushing...
-/// ```
-fn parse_feedback_kill(text: &str) -> Option<String> {
-    let mut rule = None;
-    let mut reason = None;
-    let mut target = None;
-    let mut effect = "kill";
-    for line in text.lines() {
-        let l = line.trim();
-        if let Some(rest) = l.strip_prefix("[ActPlane] Operation killed by rule `") {
-            rule = rest.split('`').next().map(str::to_string);
-            effect = "kill";
-        } else if let Some(rest) = l.strip_prefix("[ActPlane] Operation blocked by rule `") {
-            rule = rest.split('`').next().map(str::to_string);
-            effect = "block";
-        } else if let Some(rest) = l.strip_prefix("- Target operation:") {
-            target = Some(rest.trim().to_string());
-        } else if let Some(rest) = l.strip_prefix("- Reason:") {
-            reason = Some(rest.trim().to_string());
-        }
-    }
-    let rule = rule.filter(|r| !r.is_empty())?;
-    let reason = reason.unwrap_or_default();
-    let target = target.unwrap_or_default();
-    Some(flat_violation_json(&rule, effect, &target, &reason))
-}
-
-/// Parse ActPlane's console kill banner into a violation line.
-///
-/// ```text
-/// 🚫 KILLED: process 'git' (pid 58816, ppid 58060) — /usr/bin/git
-///    effect: kill
-///    reason: Force-pushing...
-/// ```
-fn parse_kill_banner(text: &str) -> Option<String> {
-    let mut target = None;
-    let mut reason = None;
-    let mut effect = None;
-    let mut saw_killed = false;
-    for line in text.lines() {
-        let l = line.trim();
-        if l.contains("KILLED:") {
-            saw_killed = true;
-            effect = Some("kill");
-            if let Some(idx) = l.rfind('—').or_else(|| l.rfind('-')) {
-                let t =
-                    l[idx + l[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)..].trim();
-                if !t.is_empty() {
-                    target = Some(t.to_string());
-                }
-            }
-        } else if let Some(rest) = l.strip_prefix("effect:") {
-            effect = Some(rest.trim());
-        } else if let Some(rest) = l.strip_prefix("reason:") {
-            reason = Some(rest.trim().to_string());
-        }
-    }
-    if !saw_killed {
-        return None;
-    }
-    // Rule name is not always on the banner; prefer destructive-vcs when the
-    // reason mentions force-push (the demo's known kill).
-    let reason = reason.unwrap_or_default();
-    let rule = if reason.to_ascii_lowercase().contains("force")
-        || reason.to_ascii_lowercase().contains("hard-reset")
-    {
-        "destructive-vcs"
-    } else {
-        "policy"
-    };
-    let target = target.unwrap_or_default();
-    let effect = effect.unwrap_or("kill");
-    Some(flat_violation_json(rule, effect, &target, &reason))
-}
-
-fn synthesize_violation_from_kill_banner(run_dir: &Path) -> Option<String> {
-    let mut files = vec![
-        run_dir.join("policy-engine.log"),
-        run_dir.join("stderr.log"),
-        run_dir.join("stdout.log"),
-    ];
-    if let Ok(entries) = std::fs::read_dir(run_dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("log") {
-                files.push(p);
-            }
-        }
-    }
-    for path in files {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some(line) = parse_kill_banner(&text) {
-                return Some(line);
-            }
-            if let Some(line) = parse_feedback_kill(&text) {
-                return Some(line);
-            }
-        }
-    }
-    None
-}
-
-fn flat_violation_json(rule: &str, effect: &str, target: &str, reason: &str) -> String {
-    format!(
-        "{{\"rule\":{rule},\"effect\":{effect},\"op\":\"exec\",\"target\":{target},\"pid\":0,\"comm\":\"\",\"reason\":{reason},\"ts\":\"\"}}",
-        rule = serde_json::to_string(rule).unwrap_or_else(|_| "\"\"".into()),
-        effect = serde_json::to_string(effect).unwrap_or_else(|_| "\"kill\"".into()),
-        target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
-        reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".into()),
-    )
-}
-
-/// Collect evidence, finalize the manifest, render the report, choose the code.
-fn finish(ctx: &Ctx, run: &mut Run, exit: i32, fail_on_violation: bool) -> Result<i32> {
-    run.manifest.exit_code = Some(exit);
-    run.manifest.ended_at = Some(now_rfc3339());
-
-    let ev = Evidence::collect(run).unwrap_or_default();
-    let duration = run.manifest.summary.duration_seconds;
-    run.manifest.summary = ev.summary.clone();
-    run.manifest.summary.duration_seconds = duration;
-
-    // Honesty rule: never leave the evidence plane as Active when it produced
-    // no observational data. An empty report labeled "Active" is worse than a
-    // clear Degraded reason.
-    if matches!(run.manifest.planes.evidence, PlaneState::Active)
-        && !actime_core::evidence::has_observational_signal(&ev.summary)
-    {
-        let reason = if run.evidence_db_path().is_file() {
-            "agentsight produced no process/file/network observations (empty or unreadable evidence.db)"
-                .to_string()
-        } else {
-            "agentsight reported active but left no evidence.db".to_string()
-        };
-        run.manifest.planes.evidence = PlaneState::Degraded(reason);
-    }
-
-    run.save_manifest()?;
-
-    let md = report::render_markdown(run, &ev);
-    let _ = std::fs::write(run.report_path(), &md);
-
-    if !ctx.quiet {
-        eprintln!();
-        eprintln!("{}", report::render_text(run, &ev, ui::width()));
-    }
-
-    if fail_on_violation && (ev.summary.blocked > 0 || ev.summary.killed > 0) {
-        return Ok(crate::EXIT_VIOLATION);
-    }
-    Ok(exit)
-}
-
-/// Launch the agent under `actplane run` on the host and wait with idle reaping.
-///
-/// Stderr is tee'd to `log_path` (and the terminal) so kill banners can be
-/// harvested even when ActPlane's events.jsonl flush races teardown.
-fn run_host_policy_wrap(
+/// When the agent tree goes idle, wait for ActPlane to exit on its own so it can
+/// flush events.jsonl. Only then escalate to SIGTERM / SIGKILL. Harvest must
+/// run only after this returns.
+fn run_host_policy_wrap<F>(
     actplane: &Path,
     policy_yaml: &Path,
     agent: &[String],
     log_path: &Path,
     limit: Option<Duration>,
     quiet: bool,
-) -> Result<i32> {
+    mut on_spawn: F,
+) -> Result<(i32, i32)>
+where
+    F: FnMut(i32),
+{
     let argv = PolicyPlane::wrap_argv(actplane, policy_yaml, agent);
     let (program, args) = argv
         .split_first()
@@ -580,7 +457,6 @@ fn run_host_policy_wrap(
 
     let log = std::fs::File::create(log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
-    // Duplicate stderr to both the terminal and the log file via a pipe + tee thread.
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
@@ -591,6 +467,8 @@ fn run_host_policy_wrap(
         .with_context(|| format!("spawning host policy wrap `{program}`"))?;
 
     let wrap_pid = child.id() as i32;
+    on_spawn(wrap_pid);
+
     if let Some(mut stderr) = child.stderr.take() {
         let mut log = log;
         let mut terminal = std::io::stderr();
@@ -600,27 +478,29 @@ fn run_host_policy_wrap(
     }
 
     let code = wait_for_wrap_pid(&mut child, wrap_pid, limit, quiet)?;
-    // Prefer the code from wait_for_wrap_pid (which maps idle-reap of a stuck
-    // actplane wrapper to 0 so short agents like `echo` keep exit 0). Only
-    // use a later wait status if we have not already decided.
-    // Child::drop calls blocking wait(); forget if still live.
+
+    // Prefer a real wait status once the wrapper has exited. If we force-reaped
+    // after the agent finished, do not surface SIGTERM(143) as the run exit.
     match child.try_wait() {
         Ok(Some(st)) => {
             let st_code = exit_status_code(st);
             if code == 0 && st_code >= 128 {
-                // We SIGTERM'd the wrapper after the agent finished.
-                Ok(0)
+                Ok((0, wrap_pid))
+            } else if code != 0 {
+                Ok((code, wrap_pid))
             } else {
-                Ok(st_code)
+                Ok((st_code, wrap_pid))
             }
         }
         Ok(None) => {
+            // Still live after wait_for_wrap_pid decided — should not happen,
+            // but never block on Drop::wait.
             std::mem::forget(child);
-            Ok(code)
+            Ok((code, wrap_pid))
         }
         Err(_) => {
             std::mem::forget(child);
-            Ok(code)
+            Ok((code, wrap_pid))
         }
     }
 }
@@ -630,17 +510,19 @@ struct TeeWriter<'a>(&'a mut std::fs::File, &'a mut std::io::Stderr);
 
 impl std::io::Write for TeeWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = self.0.write_all(buf);
-        self.1.write_all(buf)?;
-        Ok(buf.len())
+        let n = buf.len();
+        let _ = std::io::Write::write_all(self.0, buf);
+        std::io::Write::write_all(self.1, buf)?;
+        Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        let _ = self.0.flush();
-        self.1.flush()
+        let _ = std::io::Write::flush(self.0);
+        std::io::Write::flush(self.1)
     }
 }
 
-/// Wait on a host-wrap child by pid tree, with wall-clock and idle bounds.
+/// Wait on a policy-wrap child. After the agent tree is idle, prefer a natural
+/// ActPlane exit (event flush), then SIGTERM with a long grace, then SIGKILL.
 fn wait_for_wrap_pid(
     child: &mut std::process::Child,
     wrap_pid: i32,
@@ -650,10 +532,16 @@ fn wait_for_wrap_pid(
     let started = Instant::now();
     let deadline = limit.map(|l| Instant::now() + l);
     let mut idle_since: Option<Instant> = None;
+    let mut agent_seen = false;
     // Allow ActPlane eBPF setup before treating "no agent" as idle.
     const START_GRACE: Duration = Duration::from_millis(2500);
-    // Continuous period with no non-wrapper descendant before we reap.
-    const WRAP_IDLE: Duration = Duration::from_millis(1200);
+    // Continuous period with no non-wrapper descendant before we consider the
+    // agent done.
+    const WRAP_IDLE: Duration = Duration::from_millis(800);
+    // After agent idle: brief window for actplane to exit on its own. ActPlane
+    // 0.1.8 often never flushes events.jsonl on this path; harvest falls back
+    // to the engine log + policy.dsl. Bound the wait so runs stay snappy.
+    const NATURAL_EXIT: Duration = Duration::from_secs(2);
 
     loop {
         match child.try_wait() {
@@ -663,24 +551,51 @@ fn wait_for_wrap_pid(
         }
 
         if wrap_tree_has_agent(wrap_pid) {
+            agent_seen = true;
             idle_since = None;
         } else if started.elapsed() >= START_GRACE {
-            // No agent in the tree (either it never appeared, or it already
-            // exited between polls — including very short commands like echo).
             let since = *idle_since.get_or_insert_with(Instant::now);
+            // Once the agent is gone, give ActPlane a natural-exit window so it
+            // can flush events.jsonl. Only then terminate.
             if since.elapsed() >= WRAP_IDLE {
+                // Extra natural wait: actplane often exits shortly after the
+                // agent if we simply stop reaping early.
+                let natural_deadline = Instant::now() + NATURAL_EXIT;
+                while Instant::now() < natural_deadline {
+                    match child.try_wait() {
+                        Ok(Some(status)) => return Ok(exit_status_code(status)),
+                        Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                        Err(e) => return Err(e).context("waiting for actplane natural exit"),
+                    }
+                    if let (Some(limit), Some(deadline)) = (limit.as_ref(), deadline.as_ref()) {
+                        if Instant::now() >= *deadline {
+                            if !quiet {
+                                eprintln!(
+                                    "{}",
+                                    ui::warn(&format!(
+                                        "wall-clock limit of {} reached; terminating the agent",
+                                        actime_core::config::format_duration(limit)
+                                    ))
+                                );
+                            }
+                            return terminate_child_graceful(child, quiet);
+                        }
+                    }
+                }
+
                 if !quiet {
                     eprintln!(
                         "{}",
                         ui::warn(
-                            "actplane run outlived the agent; terminating the policy wrapper so the run can finish"
+                            "actplane run outlived the agent; requesting graceful shutdown so \
+                             policy events can flush"
                         )
                     );
                 }
-                std::thread::sleep(Duration::from_millis(400));
-                // The agent already finished; do not surface SIGTERM(143) from
-                // killing the stuck wrapper as the run's exit code.
-                let _ = terminate_child(child)?;
+                // Agent already finished. Map wrapper signal death to 0 so a
+                // successful short agent (echo) is not reported as 143.
+                let _ = agent_seen;
+                let _ = terminate_child_graceful(child, quiet)?;
                 return Ok(0);
             }
         }
@@ -696,7 +611,66 @@ fn wait_for_wrap_pid(
                         ))
                     );
                 }
-                return terminate_child(child);
+                return terminate_child_graceful(child, quiet);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Spawn the agent as a plain child and wait for it.
+fn run_plain_child<F>(
+    agent: &[String],
+    limit: Option<Duration>,
+    quiet: bool,
+    mut on_spawn: F,
+) -> Result<(i32, i32)>
+where
+    F: FnMut(i32),
+{
+    let (program, args) = agent
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty command"))?;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning `{program}`"))?;
+
+    let pid = child.id() as i32;
+    on_spawn(pid);
+
+    let code = wait_plain_child(&mut child, limit, quiet)?;
+    Ok((code, pid))
+}
+
+fn wait_plain_child(
+    child: &mut std::process::Child,
+    limit: Option<Duration>,
+    quiet: bool,
+) -> Result<i32> {
+    let deadline = limit.map(|l| Instant::now() + l);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(exit_status_code(status)),
+            Ok(None) => {}
+            Err(e) => return Err(e).context("polling agent child"),
+        }
+        if let (Some(limit), Some(deadline)) = (limit.as_ref(), deadline.as_ref()) {
+            if Instant::now() >= *deadline {
+                if !quiet {
+                    eprintln!(
+                        "{}",
+                        ui::warn(&format!(
+                            "wall-clock limit of {} reached; terminating the agent",
+                            actime_core::config::format_duration(limit)
+                        ))
+                    );
+                }
+                return terminate_child_graceful(child, quiet);
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -717,17 +691,24 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
     1
 }
 
-fn terminate_child(child: &mut std::process::Child) -> Result<i32> {
+/// SIGTERM with a long flush window, then SIGKILL. Never blocks forever.
+///
+/// ActPlane must be allowed to write events.jsonl on graceful exit. A tool that
+/// enforces a kill and then loses the event is worse than useless.
+fn terminate_child_graceful(child: &mut std::process::Child, _quiet: bool) -> Result<i32> {
     let pid = child.id() as i32;
     // SAFETY: positive pid; ESRCH is fine.
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
-    let grace = Instant::now() + Duration::from_millis(1000);
+    // ActPlane 0.1.8 exits on SIGTERM within ~0.5s without flushing events;
+    // keep a short grace so a future engine that does flush still has room.
+    const TERM_GRACE: Duration = Duration::from_secs(2);
+    let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
         match child.try_wait() {
             Ok(Some(st)) => return Ok(exit_status_code(st)),
-            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(e).context("waiting after SIGTERM"),
         }
     }
@@ -740,101 +721,11 @@ fn terminate_child(child: &mut std::process::Child) -> Result<i32> {
             Err(_) => break,
         }
     }
-    // Caller forgets an unreaped child so Drop::wait cannot hang the run.
-    Ok(137)
-}
-
-/// Wait for the sandboxed process, with optional wall-clock limit and
-/// host-wrap idle reaping.
-///
-/// When `reap_idle_wrap` is true the sandbox child is `actplane run` (possibly
-/// under `sudo`). ActPlane 0.1.8 often keeps that process alive after the agent
-/// exits (stuck singleton event-loop join). Once the wrap tree contains only
-/// wrapper processes (`sudo` / `actplane`) for a short idle window, we
-/// SIGTERM/SIGKILL it so the run always reaches `finish()`.
-fn wait_for_agent(
-    sandbox: &mut dyn Sandbox,
-    limit: Option<Duration>,
-    quiet: bool,
-    reap_idle_wrap: bool,
-) -> Result<i32> {
-    let started = Instant::now();
-    let deadline = limit.map(|l| Instant::now() + l);
-    let mut idle_since: Option<Instant> = None;
-    const START_GRACE: Duration = Duration::from_millis(2500);
-    const WRAP_IDLE: Duration = Duration::from_millis(1200);
-
-    loop {
-        if let Some(code) = sandbox.try_wait()? {
-            return Ok(code);
-        }
-
-        if reap_idle_wrap {
-            if let Some(pid) = sandbox.host_pid() {
-                if wrap_tree_has_agent(pid) {
-                    idle_since = None;
-                } else if started.elapsed() >= START_GRACE {
-                    let since = *idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= WRAP_IDLE {
-                        if !quiet {
-                            eprintln!(
-                                "{}",
-                                ui::warn(
-                                    "actplane run outlived the agent; terminating the policy wrapper so the run can finish"
-                                )
-                            );
-                        }
-                        std::thread::sleep(Duration::from_millis(400));
-                        let _ = terminate_sandbox(sandbox)?;
-                        return Ok(0);
-                    }
-                }
-            }
-        }
-
-        if let (Some(limit), Some(deadline)) = (limit.as_ref(), deadline.as_ref()) {
-            if Instant::now() >= *deadline {
-                if !quiet {
-                    eprintln!(
-                        "{}",
-                        ui::warn(&format!(
-                            "wall-clock limit of {} reached; terminating the agent",
-                            actime_core::config::format_duration(limit)
-                        ))
-                    );
-                }
-                return terminate_sandbox(sandbox);
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// SIGTERM then SIGKILL the sandbox child; never block forever on wait.
-fn terminate_sandbox(sandbox: &mut dyn Sandbox) -> Result<i32> {
-    let _ = sandbox.signal(libc::SIGTERM);
-    let grace = Instant::now() + Duration::from_millis(1000);
-    while Instant::now() < grace {
-        if let Some(code) = sandbox.try_wait()? {
-            return Ok(code);
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    let _ = sandbox.signal(libc::SIGKILL);
-    let kill_grace = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < kill_grace {
-        if let Some(code) = sandbox.try_wait()? {
-            return Ok(code);
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    // Last resort: do not hang the product on an unreapable child.
     Ok(137)
 }
 
 /// True when the process tree under `root_pid` still contains a non-wrapper
-/// process (the agent or its subprocesses). Wrappers are `sudo` and `actplane`.
+/// process (the agent or its subprocesses).
 fn wrap_tree_has_agent(root_pid: i32) -> bool {
     for pid in collect_descendants(root_pid) {
         let comm = read_comm(pid);
@@ -852,7 +743,6 @@ fn is_wrap_helper_comm(comm: &str) -> bool {
     )
 }
 
-/// All descendant pids of `root` (not including `root`).
 fn collect_descendants(root: i32) -> Vec<i32> {
     let mut out = Vec::new();
     let mut stack = vec![root];
@@ -905,7 +795,626 @@ fn parse_ppid_from_stat(stat: &str) -> Option<i32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Compose the policy DSL from the configured packs and files.
+// ---------------------------------------------------------------------------
+// attach target resolution
+// ---------------------------------------------------------------------------
+
+struct ResolvedTarget {
+    kind: String,
+    label: String,
+    host_pid: i32,
+    evidence_target: Option<String>,
+}
+
+fn resolve_attach_target(req: &AttachRequest) -> Result<ResolvedTarget> {
+    if let Some(pid) = req.pid {
+        if !process_is_alive(pid) {
+            bail!("no process with pid {pid}. It may have already exited.");
+        }
+        return Ok(ResolvedTarget {
+            kind: "pid".into(),
+            label: pid.to_string(),
+            host_pid: pid,
+            evidence_target: None,
+        });
+    }
+    if let Some(comm) = &req.comm {
+        let pid = find_pid_by_comm(comm)?;
+        return Ok(ResolvedTarget {
+            kind: "comm".into(),
+            label: comm.clone(),
+            host_pid: pid,
+            evidence_target: None,
+        });
+    }
+    if let Some(container) = &req.container {
+        let pid = resolve_container_host_pid(container)?;
+        return Ok(ResolvedTarget {
+            kind: "container".into(),
+            label: container.clone(),
+            host_pid: pid,
+            evidence_target: Some(format!("docker://{container}")),
+        });
+    }
+    if let Some(pod) = &req.pod {
+        let (pid, evidence) = resolve_pod_host_pid(pod)?;
+        return Ok(ResolvedTarget {
+            kind: "pod".into(),
+            label: pod.clone(),
+            host_pid: pid,
+            evidence_target: Some(evidence),
+        });
+    }
+    bail!("give one of --pid, --comm, --container, or --pod");
+}
+
+/// Resolve an already-running Docker/Podman container to its host init pid.
+///
+/// Never creates or starts a container. Missing/stopped targets are hard errors.
+fn resolve_container_host_pid(name_or_id: &str) -> Result<i32> {
+    if let Some(pid) = inspect_container_pid("docker", name_or_id) {
+        return Ok(pid);
+    }
+    if let Some(pid) = inspect_container_pid("podman", name_or_id) {
+        return Ok(pid);
+    }
+    bail!(
+        "container `{name_or_id}` was not found as a running Docker or Podman container.\n\
+         Actime does not create containers — start one yourself, then attach:\n\
+           docker run -d --name my-agent …\n\
+           actime attach --container my-agent"
+    );
+}
+
+fn inspect_container_pid(runtime: &str, name_or_id: &str) -> Option<i32> {
+    let out = Command::new(runtime)
+        .args(["inspect", "--format", "{{.State.Pid}}", name_or_id])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let pid: i32 = text.parse().ok()?;
+    if pid <= 0 {
+        // Pid 0 means the container exists but is not running.
+        return None;
+    }
+    if !process_is_alive(pid) {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Resolve an already-running Kubernetes pod on this node to a host pid.
+fn resolve_pod_host_pid(ns_pod: &str) -> Result<(i32, String)> {
+    let (ns, name) = match ns_pod.split_once('/') {
+        Some((ns, name)) if !ns.is_empty() && !name.is_empty() => (ns, name),
+        _ => bail!("pod must be `namespace/name`, e.g. `default/agent-0`. Got `{ns_pod}`."),
+    };
+    let evidence = format!("k8s://{ns}/{name}");
+
+    let out = Command::new("kubectl")
+        .args(["get", "pod", "-n", ns, name, "-o", "json"])
+        .output()
+        .with_context(|| {
+            format!(
+                "running kubectl to resolve pod {ns}/{name}. Is kubectl installed and configured?"
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "pod `{ns}/{name}` was not found or is not readable:\n  {}\n\
+             Actime does not create pods — deploy the pod yourself, then attach.",
+            stderr.trim().lines().next().unwrap_or("(no detail)")
+        );
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing kubectl pod JSON")?;
+    let container_ids = extract_container_ids(&json);
+    if container_ids.is_empty() {
+        bail!(
+            "pod `{ns}/{name}` has no running container statuses. Is the pod Running on this node?"
+        );
+    }
+
+    for cid in &container_ids {
+        let bare = strip_runtime_prefix(cid);
+        if let Some(pid) = inspect_container_pid("docker", bare)
+            .or_else(|| inspect_container_pid("podman", bare))
+            .or_else(|| crictl_container_pid(bare))
+        {
+            return Ok((pid, evidence));
+        }
+    }
+
+    bail!(
+        "pod `{ns}/{name}` is known to kubectl but its container could not be mapped to a host \
+         pid on this machine.\n\
+         Actime attach --pod only works on a node that hosts the pod (docker/podman/crictl)."
+    );
+}
+
+fn extract_container_ids(pod: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(statuses) = pod
+        .pointer("/status/containerStatuses")
+        .and_then(|v| v.as_array())
+    {
+        for st in statuses {
+            if let Some(id) = st.get("containerID").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn strip_runtime_prefix(cid: &str) -> &str {
+    // containerd://abc, docker://abc, cri-o://abc
+    cid.rsplit_once("://").map(|(_, id)| id).unwrap_or(cid)
+}
+
+fn crictl_container_pid(container_id: &str) -> Option<i32> {
+    let out = Command::new("crictl")
+        .args(["inspect", container_id])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    // Common locations across cri implementations.
+    for path in [
+        "/info/pid",
+        "/pid",
+        "/status/pid",
+        "/info/runtimeSpec/process/pid",
+    ] {
+        if let Some(pid) = json.pointer(path).and_then(|v| {
+            v.as_i64()
+                .map(|n| n as i32)
+                .or_else(|| v.as_u64().map(|n| n as i32))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }) {
+            if pid > 0 && process_is_alive(pid) {
+                return Some(pid);
+            }
+        }
+    }
+    // info is sometimes a JSON string.
+    if let Some(info_str) = json.get("info").and_then(|v| v.as_str()) {
+        if let Ok(info) = serde_json::from_str::<serde_json::Value>(info_str) {
+            if let Some(pid) = info.get("pid").and_then(|v| v.as_i64()) {
+                let pid = pid as i32;
+                if pid > 0 && process_is_alive(pid) {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// harvest + finish
+// ---------------------------------------------------------------------------
+
+/// Copy ActPlane-scoped event files into the run's `violations.jsonl`.
+///
+/// ActPlane 0.1.x `run` rewrites feedback paths via `scoped_feedback_paths`:
+/// events land under `actplane/runs/run-<pid>-<ts>/events.jsonl`. We also
+/// accept the older layout and synthesize from feedback / kill banners when
+/// the JSONL was empty after a flush race (should be rare after graceful stop).
+fn harvest_actplane_events(run: &Run) {
+    // Fast path: events already on disk.
+    let mut collected = String::new();
+    for root in [run.dir.join("actplane").join("runs"), run.dir.join("runs")] {
+        append_events_from_run_tree(&root, &mut collected);
+    }
+    // Brief poll only when a scoped runs tree exists (engine may still be
+    // closing the file after a graceful exit).
+    if collected.is_empty() && run.dir.join("actplane").join("runs").is_dir() {
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            for root in [run.dir.join("actplane").join("runs"), run.dir.join("runs")] {
+                append_events_from_run_tree(&root, &mut collected);
+            }
+            if !collected.is_empty() {
+                break;
+            }
+        }
+    }
+    if !collected.is_empty() {
+        write_violations(run, &collected);
+        return;
+    }
+
+    for root in [
+        run.dir.join("actplane").join("runs"),
+        run.dir.join("runs"),
+        run.dir.join("actplane"),
+        run.dir.clone(),
+    ] {
+        if let Some(line) = synthesize_violation_from_feedback_tree(&root) {
+            collected.push_str(&line);
+            collected.push('\n');
+            break;
+        }
+    }
+    if collected.is_empty() {
+        if let Some(line) = synthesize_violation_from_kill_banner(&run.dir) {
+            collected.push_str(&line);
+            collected.push('\n');
+        }
+    }
+    // ActPlane 0.1.8 often exits on SIGTERM without flushing events.jsonl even
+    // though the kernel already killed the process. Recover the violation from
+    // the engine log + the composed policy.dsl so the report never lies.
+    if collected.is_empty() {
+        if let Some(line) = synthesize_violation_from_log_and_policy(run) {
+            collected.push_str(&line);
+            collected.push('\n');
+        }
+    }
+    if !collected.is_empty() {
+        write_violations(run, &collected);
+    }
+}
+
+fn write_violations(run: &Run, collected: &str) {
+    let dest = run.violations_path();
+    let mut existing = std::fs::read_to_string(&dest).unwrap_or_default();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(collected);
+    let _ = std::fs::write(&dest, existing);
+}
+
+fn append_events_from_run_tree(runs_root: &Path, collected: &mut String) {
+    let Ok(entries) = std::fs::read_dir(runs_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let events = entry.path().join("events.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&events) {
+            if !text.trim().is_empty() {
+                collected.push_str(text.trim_end());
+                collected.push('\n');
+            }
+        }
+        let direct = entry.path();
+        if direct.file_name().is_some_and(|n| n == "events.jsonl") {
+            if let Ok(text) = std::fs::read_to_string(&direct) {
+                if !text.trim().is_empty() {
+                    collected.push_str(text.trim_end());
+                    collected.push('\n');
+                }
+            }
+        }
+    }
+}
+
+fn synthesize_violation_from_feedback_tree(root: &Path) -> Option<String> {
+    let mut candidates = vec![root.join("feedback.txt")];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            candidates.push(e.path().join("feedback.txt"));
+            // One more level: actplane/runs/<id>/feedback.txt
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                for i in inner.flatten() {
+                    candidates.push(i.path().join("feedback.txt"));
+                }
+            }
+        }
+    }
+    for path in candidates {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(line) = parse_feedback_kill(&text) {
+                return Some(line);
+            }
+        }
+    }
+    None
+}
+
+fn parse_feedback_kill(text: &str) -> Option<String> {
+    let mut rule = None;
+    let mut reason = None;
+    let mut target = None;
+    let mut effect = "kill";
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("[ActPlane] Operation killed by rule `") {
+            rule = rest.split('`').next().map(str::to_string);
+            effect = "kill";
+        } else if let Some(rest) = l.strip_prefix("[ActPlane] Operation blocked by rule `") {
+            rule = rest.split('`').next().map(str::to_string);
+            effect = "block";
+        } else if let Some(rest) = l.strip_prefix("- Target operation:") {
+            target = Some(rest.trim().to_string());
+        } else if let Some(rest) = l.strip_prefix("- Reason:") {
+            reason = Some(rest.trim().to_string());
+        }
+    }
+    let rule = rule.filter(|r| !r.is_empty())?;
+    let reason = reason.unwrap_or_default();
+    let target = target.unwrap_or_default();
+    Some(flat_violation_json(&rule, effect, &target, &reason))
+}
+
+fn parse_kill_banner(text: &str) -> Option<String> {
+    let mut target = None;
+    let mut reason = None;
+    let mut effect = None;
+    let mut saw_killed = false;
+    let mut cmdline = None;
+    for line in text.lines() {
+        let l = line.trim();
+        // ActPlane console banner: "🚫 KILLED: process 'git' … — /usr/bin/git"
+        if l.contains("KILLED:") || l.contains("Killed:") {
+            saw_killed = true;
+            effect = Some("kill");
+            if let Some(idx) = l.rfind('—').or_else(|| l.rfind('-')) {
+                let t =
+                    l[idx + l[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)..].trim();
+                if !t.is_empty() {
+                    target = Some(t.to_string());
+                }
+            }
+        }
+        // Bash job-control line when a child is SIGKILL'd by the policy:
+        //   "script: line N: 12345 Killed                  git push --force …"
+        if let Some(rest) = l.split_once(" Killed").map(|(_, r)| r.trim()) {
+            if !rest.is_empty() {
+                saw_killed = true;
+                effect = Some("kill");
+                cmdline = Some(rest.to_string());
+                if rest.contains("git") {
+                    target = Some(if rest.contains("--force") {
+                        "git --force".into()
+                    } else {
+                        rest.chars().take(80).collect()
+                    });
+                }
+            }
+        } else if let Some(rest) = l.strip_prefix("effect:") {
+            effect = Some(rest.trim());
+        } else if let Some(rest) = l.strip_prefix("reason:") {
+            reason = Some(rest.trim().to_string());
+        }
+    }
+    if !saw_killed {
+        return None;
+    }
+    let cmdline_l = cmdline.unwrap_or_default().to_ascii_lowercase();
+    let reason = reason.unwrap_or_else(|| {
+        if cmdline_l.contains("--force") || cmdline_l.contains(" force") {
+            "Force-pushing, hard-resetting, and cleaning discard work that cannot be recovered from the agent's own history. Use a non-destructive git command, or ask the user to run this.".into()
+        } else {
+            String::new()
+        }
+    });
+    let rule = if reason.to_ascii_lowercase().contains("force")
+        || reason.to_ascii_lowercase().contains("hard-reset")
+        || cmdline_l.contains("--force")
+        || cmdline_l.contains("git clean")
+        || cmdline_l.contains("--hard")
+    {
+        "destructive-vcs"
+    } else if cmdline_l.contains("rm") && cmdline_l.contains("-rf") {
+        "mass-deletion"
+    } else {
+        "policy"
+    };
+    let target = target.unwrap_or_default();
+    let effect = effect.unwrap_or("kill");
+    Some(flat_violation_json(rule, effect, &target, &reason))
+}
+
+/// When ActPlane leaves events.jsonl empty, reconstruct the violation from the
+/// engine log (kill evidence) and the composed `policy.dsl` (rule + because).
+fn synthesize_violation_from_log_and_policy(run: &Run) -> Option<String> {
+    let log_text = read_run_logs(run);
+    if log_text.is_empty() {
+        return None;
+    }
+    // Prefer structured banner / bash-kill parse first.
+    if let Some(line) = parse_kill_banner(&log_text) {
+        // Enrich reason from policy.dsl when the banner had a thin reason.
+        if let Some(enriched) = enrich_violation_from_policy(run, &line) {
+            return Some(enriched);
+        }
+        return Some(line);
+    }
+    // Detect kill + git --force even without a "Killed" token (exit 137 notes).
+    let lower = log_text.to_ascii_lowercase();
+    if (lower.contains("git") && lower.contains("--force"))
+        && (lower.contains("137") || lower.contains("killed") || lower.contains("sigkill"))
+    {
+        let (rule, reason) = lookup_policy_rule(run, "destructive-vcs").unwrap_or_else(|| {
+            (
+                "destructive-vcs".into(),
+                "Force-pushing, hard-resetting, and cleaning discard work that cannot be recovered from the agent's own history. Use a non-destructive git command, or ask the user to run this.".into(),
+            )
+        });
+        return Some(flat_violation_json(&rule, "kill", "git --force", &reason));
+    }
+    None
+}
+
+fn read_run_logs(run: &Run) -> String {
+    let mut out = String::new();
+    let mut files = vec![
+        run.dir.join("policy-engine.log"),
+        run.dir.join("stderr.log"),
+        run.dir.join("stdout.log"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(&run.dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("log") {
+                files.push(p);
+            }
+        }
+    }
+    for path in files {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Pull `(name, because)` from the composed policy.dsl for a known rule id.
+fn lookup_policy_rule(run: &Run, want: &str) -> Option<(String, String)> {
+    let dsl_path = run.dir.join("policy.dsl");
+    let text = std::fs::read_to_string(dsl_path).ok()?;
+    let mut current: Option<String> = None;
+    let mut because: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("rule ") {
+            if let Some(name) = rest.strip_suffix(':').map(str::trim) {
+                if let (Some(cur), Some(b)) = (current.take(), because.take()) {
+                    if cur == want {
+                        return Some((cur, b));
+                    }
+                }
+                current = Some(name.to_string());
+                because = None;
+            }
+        } else if t.starts_with("because ") {
+            let r = t.trim_start_matches("because ").trim();
+            let r = r.trim_matches('"').trim_matches('\'').to_string();
+            because = Some(r);
+        }
+    }
+    if let (Some(cur), Some(b)) = (current, because) {
+        if cur == want {
+            return Some((cur, b));
+        }
+    }
+    // Fallback: scan for the rule name and the nearest because.
+    if text.contains(&format!("rule {want}")) {
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("because ") {
+                let r = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !r.is_empty() {
+                    return Some((want.to_string(), r));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn enrich_violation_from_policy(run: &Run, flat_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(flat_json).ok()?;
+    let rule = v.get("rule")?.as_str()?;
+    let effect = v.get("effect").and_then(|e| e.as_str()).unwrap_or("kill");
+    let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("");
+    let mut reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some((_, because)) = lookup_policy_rule(run, rule) {
+        if reason.is_empty() || reason.len() < because.len() / 2 {
+            reason = because;
+        }
+    }
+    if reason.is_empty() {
+        return None;
+    }
+    Some(flat_violation_json(rule, effect, target, &reason))
+}
+
+fn synthesize_violation_from_kill_banner(run_dir: &Path) -> Option<String> {
+    let mut files = vec![
+        run_dir.join("policy-engine.log"),
+        run_dir.join("stderr.log"),
+        run_dir.join("stdout.log"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(run_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("log") {
+                files.push(p);
+            }
+        }
+    }
+    for path in files {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(line) = parse_kill_banner(&text) {
+                return Some(line);
+            }
+            if let Some(line) = parse_feedback_kill(&text) {
+                return Some(line);
+            }
+        }
+    }
+    None
+}
+
+fn flat_violation_json(rule: &str, effect: &str, target: &str, reason: &str) -> String {
+    format!(
+        "{{\"rule\":{rule},\"effect\":{effect},\"op\":\"exec\",\"target\":{target},\"pid\":0,\"comm\":\"\",\"reason\":{reason},\"ts\":\"\"}}",
+        rule = serde_json::to_string(rule).unwrap_or_else(|_| "\"\"".into()),
+        effect = serde_json::to_string(effect).unwrap_or_else(|_| "\"kill\"".into()),
+        target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
+        reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".into()),
+    )
+}
+
+fn finish(ctx: &Ctx, run: &mut Run, exit: i32, fail_on_violation: bool) -> Result<i32> {
+    run.manifest.exit_code = Some(exit);
+    run.manifest.ended_at = Some(now_rfc3339());
+
+    let ev = Evidence::collect(run).unwrap_or_default();
+    let duration = run.manifest.summary.duration_seconds;
+    run.manifest.summary = ev.summary.clone();
+    run.manifest.summary.duration_seconds = duration;
+
+    if matches!(run.manifest.planes.evidence, PlaneState::Active)
+        && !actime_core::evidence::has_observational_signal(&ev.summary)
+    {
+        let reason = if run.evidence_db_path().is_file() {
+            "agentsight produced no process/file/network observations (empty or unreadable evidence.db)"
+                .to_string()
+        } else {
+            "agentsight reported active but left no evidence.db".to_string()
+        };
+        run.manifest.planes.evidence = PlaneState::Degraded(reason);
+    }
+
+    run.save_manifest()?;
+
+    let md = report::render_markdown(run, &ev);
+    let _ = std::fs::write(run.report_path(), &md);
+
+    if !ctx.quiet {
+        eprintln!();
+        eprintln!("{}", report::render_text(run, &ev, ui::width()));
+    }
+
+    if fail_on_violation && (ev.summary.blocked > 0 || ev.summary.killed > 0) {
+        return Ok(crate::EXIT_VIOLATION);
+    }
+    Ok(exit)
+}
+
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
 fn compose(cfg: &Config, workspace: &str) -> Result<String> {
     let mut extra = Vec::new();
     for path in &cfg.policy.files {
@@ -916,115 +1425,12 @@ fn compose(cfg: &Config, workspace: &str) -> Result<String> {
     embedded::compose_policy(&cfg.policy.packs, &extra, workspace)
 }
 
-/// Pick the backend, honoring `auto` and the strict profile's refusal of host mode.
-fn resolve_backend(cfg: &Config) -> Result<Backend> {
-    let requested = cfg.sandbox.backend.trim().to_ascii_lowercase();
-    let strict = cfg.profile == "strict";
-
-    if requested != "auto" {
-        let backend = parse_backend(&requested)?;
-        if strict && backend == Backend::Host {
-            bail!(
-                "the `strict` profile requires a sandbox, and `--sandbox host` has none.\n\
-                 Install Docker, Podman, or bubblewrap, or use `--profile balanced`."
-            );
-        }
-        return Ok(backend);
-    }
-
-    let available = Backend::detect_available();
-    let chosen = available
-        .iter()
-        .copied()
-        .find(|b| !strict || *b != Backend::Host);
-
-    match chosen {
-        Some(b) => Ok(b),
-        None => bail!(
-            "the `strict` profile requires a sandbox, but no container runtime or \
-             bubblewrap was found.\n\
-             Install Docker, Podman, or bubblewrap, or use `--profile balanced`."
-        ),
-    }
-}
-
-fn parse_backend(name: &str) -> Result<Backend> {
-    Ok(match name {
-        "docker" => Backend::Docker,
-        "podman" => Backend::Podman,
-        "bwrap" | "bubblewrap" => Backend::Bwrap,
-        "host" | "none" => Backend::Host,
-        other => {
-            bail!("unknown sandbox backend `{other}`. Use auto, docker, podman, bwrap, or host.")
-        }
-    })
-}
-
-/// A note recorded in the manifest when the isolation plane is not real.
-fn spec_note(backend: Backend) -> Option<String> {
-    match backend {
-        Backend::Host => Some("no isolation: the agent ran directly on the host".into()),
-        Backend::Bwrap => Some("namespace isolation only; no container runtime".into()),
-        _ => None,
-    }
-}
-
-/// Translate the config into a sandbox spec.
-fn build_spec(cfg: &Config, run: &Run, cwd: &Path, backend: Backend) -> Result<SandboxSpec> {
-    let mut spec = SandboxSpec::new(format!("actime-{}", run.id), cfg.sandbox.image.clone());
-
-    // Container backends chdir to the guest workdir (default `/workspace`).
-    // Host and bwrap run against real host paths: the agent must inherit the
-    // caller's cwd, never a leftover host `/workspace` from a container mount.
-    match backend {
-        Backend::Docker | Backend::Podman => {
-            spec.workdir = PathBuf::from(&cfg.sandbox.workdir);
-        }
-        Backend::Bwrap => {
-            // bwrap still uses guest paths for --chdir once mounts are applied.
-            spec.workdir = PathBuf::from(&cfg.sandbox.workdir);
-        }
-        Backend::Host => {
-            spec.workdir = cwd.to_path_buf();
-        }
-    }
-
-    let mut mounts = Vec::new();
-    for m in &cfg.sandbox.mounts {
-        mounts.push(Mount::parse(m).with_context(|| format!("parsing the mount `{m}`"))?);
-    }
-    spec.mounts = mounts;
-    spec.resolve_mount_hosts(cwd);
-
-    spec.network = match cfg.sandbox.network {
-        actime_core::config::NetworkMode::Allow => NetworkMode::Allow,
-        actime_core::config::NetworkMode::Deny => NetworkMode::Deny,
-        actime_core::config::NetworkMode::Egress => NetworkMode::Egress,
-    };
-    spec.allow_egress = cfg.sandbox.allow_egress.clone();
-    spec.cpus = cfg.sandbox.cpus;
-    spec.memory = cfg.sandbox.memory.clone();
-    spec.keep = cfg.sandbox.keep;
-
-    // Only named variables cross the boundary, and only when they are set.
-    let mut env: Vec<(String, String)> = Vec::new();
-    for name in &cfg.sandbox.env_passthrough {
-        if let Ok(v) = std::env::var(name) {
-            env.push((name.clone(), v));
-        }
-    }
-    env.push(("ACTIME_RUN_ID".into(), run.id.to_string()));
-    if backend == Backend::Docker || backend == Backend::Podman {
-        env.push(("ACTIME_WORKSPACE".into(), cfg.sandbox.workdir.clone()));
+fn packs_label(cfg: &Config) -> String {
+    if cfg.policy.packs.is_empty() {
+        "custom".to_string()
     } else {
-        env.push(("ACTIME_WORKSPACE".into(), cwd.display().to_string()));
+        cfg.policy.packs.join(", ")
     }
-    // Widen ActPlane's hook budget when the agent is launched under
-    // `actplane run` (host wrap path inherits this env).
-    env.push(("ACTPLANE_HOOK_PROFILE".into(), "full".into()));
-    spec.env = env;
-
-    Ok(spec)
 }
 
 fn to_plane_state(o: &Outcome) -> PlaneState {
@@ -1039,239 +1445,10 @@ fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339()
 }
 
-/// `actime shell` — an interactive shell inside the sandbox, same planes.
-pub fn shell(ctx: &Ctx, sandbox: Option<String>, image: Option<String>) -> Result<i32> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let argv = vec![shell];
-    run(
-        ctx,
-        RunRequest {
-            argv,
-            sandbox,
-            policy: None,
-            image,
-            no_evidence: false,
-            no_history: true,
-            fail_on_violation: false,
-            timeout: None,
-        },
-    )
-}
-
-/// `actime attach` — bind the planes to an agent that is already running.
-pub fn attach(
-    ctx: &Ctx,
-    pid: Option<i32>,
-    comm: Option<String>,
-    policy: Option<String>,
-) -> Result<i32> {
-    let cwd = std::env::current_dir().context("resolving the current directory")?;
-    let mut cfg = ctx.load_config(&cwd)?;
-    if let Some(mode) = policy {
-        cfg.policy.mode = mode.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-
-    let pid = match (pid, comm.as_deref()) {
-        (Some(pid), _) => pid,
-        (None, Some(comm)) => find_pid_by_comm(comm)?,
-        (None, None) => bail!("give either --pid or --comm"),
-    };
-
-    let components = Components::detect();
-    let store = RunStore::open_default()?;
-    let argv = vec![format!("attach:{pid}")];
-    let mut run = store.create(&argv, &cfg)?;
-
-    run.manifest.planes.isolation =
-        PlaneState::Disabled("attach binds an existing process; it does not isolate it".into());
-
-    let dsl = compose(&cfg, &cwd.display().to_string())?;
-    let packs = cfg.policy.packs.join(", ");
-    let mut policy_plane = PolicyPlane::start(PolicyPlaneSpec {
-        binary: components.actplane.path.as_deref(),
-        version: components.actplane.version.as_deref(),
-        mode: &cfg.policy.mode.to_string(),
-        dsl: &dsl,
-        packs: &packs,
-        policy_yaml: run.policy_path(),
-        violations: run.violations_path(),
-        feedback: run.dir.join("feedback.txt"),
-        audit: run.dir.join("policy-audit.jsonl"),
-        host_pid: Some(pid),
-        wrap_command: false,
-        feedback_enabled: cfg.policy.feedback,
-        log: run.dir.join("policy-engine.log"),
-    });
-    run.manifest.planes.policy = to_plane_state(&policy_plane.outcome);
-
-    let mut evidence = EvidencePlane::start(EvidencePlaneSpec {
-        binary: components.agentsight.path.as_deref(),
-        version: components.agentsight.version.as_deref(),
-        enabled: cfg.evidence.enabled,
-        target: None,
-        host_pid: Some(pid),
-        db: run.evidence_db_path(),
-        log: run.dir.join("evidence-engine.log"),
-    });
-    run.manifest.planes.evidence = to_plane_state(&evidence.outcome);
-    let _ = run.save_manifest();
-
-    eprintln!(
-        "{}",
-        ui::banner(
-            run.id.as_str(),
-            &format!("attached pid {pid}"),
-            &cfg.policy.mode.to_string(),
-            if evidence.outcome.is_active() {
-                "on"
-            } else {
-                "off"
-            },
-        )
-    );
-    eprintln!(
-        "{}",
-        ui::note(
-            "attach is post-hoc: it binds future events from this process tree, but it \
-             cannot reconstruct what happened before now. Press Ctrl-C to detach."
-        )
-    );
-
-    // Hold the planes open until the target exits or the user detaches.
-    while process_is_alive(pid) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    policy_plane.stop();
-    evidence.stop();
-    finish(ctx, &mut run, 0, false)
-}
-
-/// `actime demo` — the bundled stand-in agent, end to end.
-pub fn demo(ctx: &Ctx, sandbox: Option<String>, policy: &str) -> Result<i32> {
-    let dir = std::env::temp_dir().join(format!("actime-demo-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).context("creating the demo directory")?;
-    // When actime runs under sudo, ActPlane drops the wrapped agent back to
-    // SUDO_UID. The scratch dir must be writable by that user or the demo
-    // agent cannot create its files.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
-        if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-            if let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) {
-                // SAFETY: chown on a path we just created; failure is non-fatal.
-                unsafe {
-                    let c = std::ffi::CString::new(dir.display().to_string()).ok();
-                    if let Some(c) = c {
-                        let _ = libc::chown(c.as_ptr(), uid, gid);
-                    }
-                }
-            }
-        }
-    }
-    // The script is named `actime-demo-agent` on purpose: the shipped policy
-    // packs list that name as an AGENT source, so the demo exercises real rules.
-    let script = dir.join("actime-demo-agent");
-    {
-        let mut f = std::fs::File::create(&script)
-            .with_context(|| format!("writing {}", script.display()))?;
-        f.write_all(embedded::DEMO_AGENT.as_bytes())?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    if !ctx.quiet {
-        eprintln!(
-            "{}",
-            ui::note(&format!(
-                "running the bundled stand-in agent in {}",
-                dir.display()
-            ))
-        );
-    }
-
-    // Run the demo from the scratch dir so the stand-in agent can write its
-    // files regardless of what the caller's cwd is (or whether /workspace
-    // exists on the host). Use a *relative* argv so the same path works on
-    // the host and inside a container where `.` is mounted at `/workspace`.
-    let prev = std::env::current_dir().ok();
-    if let Err(e) = std::env::set_current_dir(&dir) {
-        bail!("cannot enter demo directory {}: {e}", dir.display());
-    }
-
-    let demo_argv = vec!["./actime-demo-agent".to_string()];
-
-    let req = RunRequest {
-        argv: demo_argv.clone(),
-        sandbox: sandbox.clone(),
-        policy: Some(policy.to_string()),
-        image: None,
-        no_evidence: false,
-        // Skip history in the demo so a stuck akeep vault cannot delay the
-        // out-of-box experience (akeep is still hard-bounded on normal runs).
-        no_history: true,
-        fail_on_violation: false,
-        // Hard ceiling so a stuck wrap engine can never hang forever.
-        timeout: Some("90s".into()),
-    };
-
-    let result = match run(ctx, req) {
-        Err(e) if should_fallback_demo_to_host(sandbox.as_deref(), &e) => {
-            if !ctx.quiet {
-                eprintln!(
-                    "{}",
-                    ui::warn(&format!(
-                        "docker/podman sandbox could not start ({e:#}); falling back to --sandbox host"
-                    ))
-                );
-            }
-            run(
-                ctx,
-                RunRequest {
-                    argv: demo_argv,
-                    sandbox: Some("host".into()),
-                    policy: Some(policy.to_string()),
-                    image: None,
-                    no_evidence: false,
-                    no_history: true,
-                    fail_on_violation: false,
-                    timeout: Some("90s".into()),
-                },
-            )
-        }
-        other => other,
-    };
-
-    if let Some(p) = prev {
-        let _ = std::env::set_current_dir(p);
-    }
-    result
-}
-
-/// Whether a failed demo under docker/podman should retry on the host backend.
-fn should_fallback_demo_to_host(requested: Option<&str>, err: &anyhow::Error) -> bool {
-    let backend = requested.unwrap_or("auto");
-    // Explicit host requests never fall back (they already are host).
-    if matches!(backend, "host" | "none" | "bwrap" | "bubblewrap") {
-        return false;
-    }
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("sandbox image")
-        || msg.contains("unable to find image")
-        || msg.contains("manifest unknown")
-        || msg.contains("no such image")
-        || msg.contains("could not be pulled")
-        || msg.contains("starting the docker sandbox")
-        || msg.contains("starting the podman sandbox")
-}
-
-/// Find the newest pid whose `comm` matches, so `--comm claude` picks the agent
-/// the user just started rather than one from an hour ago.
 fn find_pid_by_comm(comm: &str) -> Result<i32> {
+    // Linux TASK_COMM_LEN is 16 (15 chars + NUL). Long names are truncated in
+    // /proc/<pid>/comm; also match by cmdline basename when needed.
+    let comm_trunc: String = comm.chars().take(15).collect();
     let mut best: Option<(u64, i32)> = None;
     let entries = std::fs::read_dir("/proc").context("reading /proc")?;
     for entry in entries.flatten() {
@@ -1279,13 +1456,16 @@ fn find_pid_by_comm(comm: &str) -> Result<i32> {
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
-        let Ok(found) = std::fs::read_to_string(entry.path().join("comm")) else {
+        let path = entry.path();
+        let Ok(found) = std::fs::read_to_string(path.join("comm")) else {
             continue;
         };
-        if found.trim() != comm {
+        let found = found.trim();
+        let matches = found == comm || found == comm_trunc || cmdline_basename_matches(&path, comm);
+        if !matches {
             continue;
         }
-        let starttime = std::fs::read_to_string(entry.path().join("stat"))
+        let starttime = std::fs::read_to_string(path.join("stat"))
             .ok()
             .and_then(|s| parse_starttime(&s))
             .unwrap_or(0);
@@ -1299,8 +1479,18 @@ fn find_pid_by_comm(comm: &str) -> Result<i32> {
     }
 }
 
-/// Field 22 of `/proc/<pid>/stat` is the process start time. The comm field can
-/// contain spaces and parentheses, so parse after the final `)`.
+fn cmdline_basename_matches(proc_dir: &Path, want: &str) -> bool {
+    let Ok(raw) = std::fs::read(proc_dir.join("cmdline")) else {
+        return false;
+    };
+    let first = raw.split(|b| *b == 0).next().unwrap_or_default();
+    let path = String::from_utf8_lossy(first);
+    Path::new(path.as_ref())
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|base| base == want)
+}
+
 fn parse_starttime(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(19)?.parse().ok()
@@ -1310,68 +1500,12 @@ fn process_is_alive(pid: i32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// Component versions as a map, for the manifest.
-#[allow(dead_code)]
-fn component_versions(c: &Components) -> BTreeMap<String, String> {
-    c.iter()
-        .filter_map(|c| c.version.as_ref().map(|v| (c.name.to_string(), v.clone())))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn backend_names_map_to_variants() {
-        assert_eq!(parse_backend("docker").expect("docker"), Backend::Docker);
-        assert_eq!(parse_backend("podman").expect("podman"), Backend::Podman);
-        assert_eq!(parse_backend("bwrap").expect("bwrap"), Backend::Bwrap);
-        assert_eq!(
-            parse_backend("bubblewrap").expect("bubblewrap"),
-            Backend::Bwrap
-        );
-        assert_eq!(parse_backend("host").expect("host"), Backend::Host);
-        assert_eq!(parse_backend("none").expect("none"), Backend::Host);
-    }
-
-    #[test]
-    fn an_unknown_backend_lists_the_valid_ones() {
-        let err = parse_backend("firecracker").unwrap_err().to_string();
-        assert!(err.contains("firecracker"));
-        assert!(err.contains("docker"));
-        assert!(err.contains("host"));
-    }
-
-    #[test]
-    fn strict_refuses_host_mode() {
-        let mut cfg = Config::builtin_profile("strict").expect("strict profile");
-        cfg.sandbox.backend = "host".into();
-        let err = resolve_backend(&cfg).unwrap_err().to_string();
-        assert!(err.contains("strict"));
-        assert!(err.contains("requires a sandbox"));
-    }
-
-    #[test]
-    fn balanced_allows_host_mode() {
-        let mut cfg = Config::builtin_profile("balanced").expect("balanced profile");
-        cfg.sandbox.backend = "host".into();
-        assert_eq!(resolve_backend(&cfg).expect("host"), Backend::Host);
-    }
-
-    #[test]
-    fn the_workspace_note_marks_host_mode_as_unisolated() {
-        assert!(spec_note(Backend::Host)
-            .expect("note")
-            .contains("no isolation"));
-        assert!(spec_note(Backend::Bwrap).is_some());
-        assert!(spec_note(Backend::Docker).is_none());
-    }
-
-    #[test]
     fn proc_stat_starttime_survives_a_comm_with_spaces() {
-        // A synthetic stat line: pid, "(weird name)", state, then 19 more
-        // fields before starttime at field 22.
         let mut fields: Vec<String> = vec!["S".into()];
         for i in 1..=18 {
             fields.push(i.to_string());
@@ -1398,60 +1532,15 @@ mod tests {
     }
 
     #[test]
-    fn a_sandboxed_run_composes_policy_against_the_guest_workspace() {
+    fn a_run_composes_policy_against_the_real_workspace() {
         let cfg = Config::builtin_profile("balanced").expect("balanced");
-        let dsl = compose(&cfg, "/workspace").expect("compose");
-        assert!(dsl.contains("/workspace"));
+        let dsl = compose(&cfg, "/home/user/proj").expect("compose");
+        assert!(dsl.contains("/home/user/proj"));
         assert!(!dsl.contains("${WORKSPACE}"));
     }
 
     #[test]
-    fn demo_falls_back_to_host_on_missing_image() {
-        assert!(should_fallback_demo_to_host(
-            Some("docker"),
-            &anyhow::anyhow!(
-                "starting the docker sandbox: sandbox image `ghcr.io/eunomia-bpf/actime-sandbox:latest` is not available locally and could not be pulled."
-            )
-        ));
-        assert!(should_fallback_demo_to_host(
-            Some("auto"),
-            &anyhow::anyhow!("Unable to find image 'x' locally")
-        ));
-        // Explicit host never "falls back".
-        assert!(!should_fallback_demo_to_host(
-            Some("host"),
-            &anyhow::anyhow!("sandbox image missing")
-        ));
-        assert!(!should_fallback_demo_to_host(
-            Some("docker"),
-            &anyhow::anyhow!("permission denied while trying to connect to the docker API")
-        ));
-    }
-
-    #[test]
-    fn host_build_spec_uses_caller_cwd_not_guest_workspace() {
-        let cfg = Config::builtin_profile("balanced").expect("balanced");
-        let cwd = PathBuf::from("/tmp/actime-host-cwd-test");
-        // Build a synthetic Run without touching the store.
-        let run = actime_core::run::Run {
-            id: actime_core::run::RunId("test-run".into()),
-            dir: PathBuf::from("/tmp"),
-            manifest: actime_core::run::Manifest::new(
-                "test-run",
-                &["echo".into()],
-                &cfg,
-                cwd.clone(),
-            ),
-        };
-        let spec = build_spec(&cfg, &run, &cwd, Backend::Host).expect("spec");
-        assert_eq!(spec.workdir, cwd);
-        let docker = build_spec(&cfg, &run, &cwd, Backend::Docker).expect("spec");
-        assert_eq!(docker.workdir, PathBuf::from(&cfg.sandbox.workdir));
-    }
-
-    #[test]
     fn parse_ppid_from_stat_handles_comm_with_spaces() {
-        // pid (comm with spaces) state ppid ...
         let stat = "42 (weird name) S 17 18 19 20 21 22";
         assert_eq!(parse_ppid_from_stat(stat), Some(17));
     }
@@ -1481,6 +1570,53 @@ mod tests {
         let line = parse_kill_banner(text).expect("line");
         assert!(line.contains("destructive-vcs") || line.contains("kill"));
         assert!(line.contains("Force-pushing"));
+    }
+
+    #[test]
+    fn parse_bash_killed_line_maps_force_push_to_destructive_vcs() {
+        let text = "/tmp/actime-demo-agent: line 13: 3517655 Killed                  git push --force origin HEAD 2>&1\n";
+        let line = parse_kill_banner(text).expect("line");
+        assert!(line.contains("destructive-vcs"), "line={line}");
+        assert!(line.contains("kill"), "line={line}");
+        assert!(
+            line.contains("Force-pushing") || line.contains("force"),
+            "line={line}"
+        );
+    }
+
+    #[test]
+    fn harvest_synthesizes_from_engine_log_when_events_empty() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(run_dir.join("actplane/runs/run-1")).unwrap();
+        // Empty events — the failure mode we must recover from.
+        std::fs::write(run_dir.join("actplane/runs/run-1/events.jsonl"), "").unwrap();
+        std::fs::write(
+            run_dir.join("policy-engine.log"),
+            "ActPlane: running\n/tmp/a: line 13: 1 Killed                  git push --force origin HEAD\n",
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("policy.dsl"),
+            "rule destructive-vcs:\n  kill exec \"git\" \"--force\" if AGENT\n  because \"Force-pushing discards work that cannot be recovered.\"\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let run = actime_core::run::Run {
+            id: actime_core::run::RunId("test-run".into()),
+            dir: run_dir.clone(),
+            manifest: actime_core::run::Manifest::new(
+                "test-run",
+                &["x".into()],
+                &cfg,
+                run_dir.clone(),
+            ),
+        };
+        harvest_actplane_events(&run);
+        let v = std::fs::read_to_string(run.violations_path()).expect("violations");
+        assert!(v.contains("destructive-vcs"), "v={v}");
+        assert!(v.contains("Force-pushing") || v.contains("force"), "v={v}");
+        assert!(v.contains("kill"), "v={v}");
     }
 
     #[test]
@@ -1517,5 +1653,35 @@ mod tests {
         let v = std::fs::read_to_string(run.violations_path()).expect("violations");
         assert!(v.contains("destructive-vcs"));
         assert!(v.contains("kill"));
+    }
+
+    #[test]
+    fn strip_runtime_prefix_handles_cri_ids() {
+        assert_eq!(strip_runtime_prefix("containerd://abc123"), "abc123");
+        assert_eq!(strip_runtime_prefix("docker://xyz"), "xyz");
+        assert_eq!(strip_runtime_prefix("plain"), "plain");
+    }
+
+    #[test]
+    fn extract_container_ids_from_pod_json() {
+        let pod = serde_json::json!({
+            "status": {
+                "containerStatuses": [
+                    {"containerID": "containerd://aaa"},
+                    {"containerID": "docker://bbb"}
+                ]
+            }
+        });
+        let ids = extract_container_ids(&pod);
+        assert_eq!(ids, vec!["containerd://aaa", "docker://bbb"]);
+    }
+
+    #[test]
+    fn nonexistent_container_errors_clearly() {
+        let err = resolve_container_host_pid("actime-definitely-nonexistent-xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was not found") || err.contains("not found"));
+        assert!(err.contains("does not create") || err.contains("Start one"));
     }
 }
