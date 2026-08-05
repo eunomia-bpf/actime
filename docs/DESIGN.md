@@ -289,8 +289,13 @@ No container is created, ever.
 2. `RunStore::create` → run directory, write effective `actime.yaml`.
 3. Compose policy with `${WORKSPACE}` = the real host cwd.
 4. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
-   wrap the agent with `actplane run -- <argv>` (launch-time enforcement).
-   In `enforce` mode a failure to start aborts the run (fail closed).
+   wrap the agent with `actplane --policy <file> run -- <argv>` (launch-time
+   enforcement; the engine installs the composed policy for that run).
+   Outcome is only **Active** when the policy is verifiably installed: if the
+   engine log reports an install failure (feature budget, CAP_BPF, etc.), the
+   plane is reclassified to **Disabled** with the engine's reason. In
+   `enforce` mode a failure to start *or* install aborts the run (fail closed)
+   rather than reporting Active while nothing was constrained.
 5. **Evidence plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
    once the child exists. Always fail-soft.
 6. Wait for the agent / wrap. Enforce `limits.wall_clock`. Prefer natural

@@ -4,7 +4,8 @@ Actime policies are [ActPlane](https://github.com/eunomia-bpf/ActPlane) rules.
 They are evaluated in the kernel against real OS effects (`exec`, `open`,
 `read`, `write`, `unlink`, `connect`), not against tool calls. That is the
 whole point: a rule you write once holds whether the agent used a tool, a bash
-one-liner, a Python subprocess, or a subagent it spawned.
+one-liner, a Python subprocess, or a subagent it spawned — wherever Actime is
+deployed.
 
 ## The three modes
 
@@ -13,6 +14,9 @@ actime run --policy off      -- claude   # no policy plane at all
 actime run --policy observe  -- claude   # every match is recorded, nothing is stopped
 actime run --policy enforce  -- claude   # matches are blocked or killed
 ```
+
+`--policy` also works on `actime attach`, for a target that is already
+running.
 
 **Start in `observe`.** Run it for a week across your team. Read
 `actime report` and see which rules would have fired and how often. Then
@@ -50,19 +54,21 @@ The packs live in `policies/` and are embedded into the binary, so
 
 The default. Deliberately boring: it stops effects no coding agent should
 produce during ordinary development and stays out of the way of everything
-else. Five rules:
+else. Two rules:
 
 | Rule | Effect | What it stops |
 |---|---|---|
-| `system-fence` | block | writes and deletes under `/etc`, `/usr`, `/bin`, `/sbin`, `/boot` |
-| `evidence-integrity` | block | the agent editing or deleting its own run record under `.actime/` |
-| `credential-access` | notify | reads of `**/.ssh/id_*`, `**/.aws/credentials`, `**/.config/gh/hosts.yml`, `**/.npmrc`, `**/.docker/config.json` |
 | `destructive-vcs` | kill | `git` with `--force`, `--hard`, or `clean` |
-| `mass-deletion` | kill | `rm -rf` whose target is outside `${WORKSPACE}/**` |
+| `mass-deletion` | kill | `rm -rf` (unrestricted; see below) |
 
-Note that `credential-access` only *reports*. Blocking credential reads breaks
-real tooling, and the useful control is not on the read; it is on where the
-data goes afterwards. That is `no-secret-egress`.
+An honest limitation, straight from the pack's own header: with ActPlane
+0.1.8, file open/write sink rules and some path-matcher classes do not load as
+runtime policy, so the file-path fences this pack will eventually carry
+(system fence, evidence integrity, credential reporting, workspace-scoped
+`rm -rf`) are not in it yet. The pack keeps the rules that load and enforce
+today — exec `kill` — so the product thesis (a force-push is stopped) is
+demonstrable. The unrestricted `rm -rf` form is stricter than the planned
+path-scoped one, deliberately.
 
 ### `no-vcs-write`
 
@@ -113,7 +119,8 @@ rule no-secret-egress:
 Secret-shaped files carry a label. The label propagates with the data (through
 reads, writes, forks, and execs), so a value read from `.env`, written to a
 temp file, piped through `jq`, and posted by a Python subprocess is *still*
-labeled when it reaches the socket. The connection is refused there.
+labeled when it reaches the socket. The connection is refused there. Reading a
+secret is allowed; reaching the network afterwards is not.
 
 The offending syscall is an ordinary `connect`. What makes it a violation is
 its history, and history is what Actime tracks.
@@ -159,9 +166,11 @@ rule mediated-deploy:
   because "Deploys to staging go through ./scripts/review-gate. Run that instead of calling the endpoint directly."
 ```
 
-`${WORKSPACE}` is substituted with the absolute path of the project directory
-as the running agent sees it: `/workspace` inside a container, your real path
-on the host. Use it so the same policy file works in both.
+`${WORKSPACE}` is substituted once, at compose time, with the absolute path of
+the project directory as the running agent sees it: your real cwd on the host,
+or the guest path when Actime runs inside a container
+([deployment position B](./deployment.md)). Never hardcode a path in a policy;
+use `${WORKSPACE}` so the same file works in both.
 
 ### Validate before you run
 
@@ -171,13 +180,15 @@ actime policy explain    # what your kernel can enforce before the fact vs. afte
 ```
 
 Both call the installed `actplane` binary. `check` compiles without loading
-anything and needs no privileges, so it belongs in CI; a clean run prints
-`ok N rules compiled from <packs>`. `explain` prints ActPlane's review of the
-composed policy against this host: which sources and rules the kernel can
-enforce pre-operation. It matters because `block` is a pre-operation denial
-only where BPF-LSM can see the arguments; for argv-sensitive rules like
-`git commit`, `kill` is the honest effect, and `explain` tells you which is
-which.
+anything and needs no privileges, so it belongs in CI. `explain` prints
+ActPlane's review of the composed policy against this host: which sources and
+rules the kernel can enforce pre-operation. It matters because `block` is a
+pre-operation denial only where BPF-LSM can see the arguments; for
+argv-sensitive rules like `git commit`, `kill` is the honest effect, and
+`explain` tells you which is which. Both subcommands require an `actplane`
+new enough to support them (`check` needs `compile --json`, which landed in
+0.1.8; on older engines `check` falls back to a plain compile with no JSON
+report and tells you to upgrade).
 
 ## Corrective feedback
 

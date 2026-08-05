@@ -1,13 +1,16 @@
 # Configuration
 
 Actime is configured by a single optional `actime.yaml`. Every field is
-optional. `actime run -- claude` with **no config file at all** works, using the
-`balanced` profile and `backend: auto`.
+optional. `actime run -- claude` with **no config file at all** works, using
+the built-in `balanced` profile.
 
 > This document is a complete reference for the schema defined in
 > [docs/DESIGN.md §4](./DESIGN.md#4-configuration-actimeyaml), cross-checked
 > against `crates/actime-core/src/config.rs`. If a field, value, or flag is not
 > listed here, it does not exist. The schema version is `1`.
+>
+> There is no `sandbox` section. Actime does not manage sandboxes; see
+> [deployment.md](./deployment.md) for how Actime composes with yours.
 
 ## Resolution order
 
@@ -42,21 +45,6 @@ actime init --force            # overwrite an existing actime.yaml
 version: 1
 profile: balanced            # observe | balanced | strict | <path to profile yaml>
 
-sandbox:
-  backend: auto              # auto | docker | podman | bwrap | host
-  image: ghcr.io/eunomia-bpf/actime-sandbox:latest
-  workdir: /workspace
-  mounts:                    # host:container:mode
-    - ".:/workspace:rw"
-  network: allow             # allow | deny | egress
-  allow_egress: []           # hostnames allowed when network: egress
-  env_passthrough:           # host env vars copied into the sandbox
-    - ANTHROPIC_API_KEY
-    - OPENAI_API_KEY
-  cpus: null                 # e.g. 4
-  memory: null               # e.g. "8G"
-  keep: false                # keep container after exit for debugging
-
 policy:
   mode: enforce              # off | observe | enforce
   packs:                     # built-in packs from policies/
@@ -67,7 +55,7 @@ policy:
 evidence:
   enabled: true
   capture: [process, file, network, ssl, resource]
-  export: []                 # otlp | sqlite | json
+  export: []                 # otlp | sqlite | json (json always written)
   redact: true               # strip auth headers and secret-shaped values
 
 history:
@@ -86,50 +74,33 @@ limits:
 | `version` | integer | `1` | Config schema version. Currently `1`. |
 | `profile` | string \| path | `balanced` | One of `observe`, `balanced`, `strict`, or a path to a profile yaml. The profile is the base layer that file values are merged over. |
 
-### `sandbox` -- isolation plane
-
-The sandbox backend answers the question "what can the agent reach?". See
-[sandbox.md](./sandbox.md) for the full backend behavior and probe order.
-
-| Field | Type | Default | Meaning |
-|-------|------|---------|---------|
-| `backend` | enum | `auto` | `auto` probes Docker, then Podman, then Bubblewrap, then `host`. The others force a specific backend. |
-| `image` | string | `ghcr.io/eunomia-bpf/actime-sandbox:latest` | Container image used by the `docker` and `podman` backends. Ignored by `bwrap` and `host`. |
-| `workdir` | string | `/workspace` | Working directory inside the sandbox. Where the workspace is bind-mounted by default. |
-| `mounts` | list of `host:container:mode` | `[".:/workspace:rw"]` | Bind mounts. `mode` is `rw` or `ro`. |
-| `network` | enum | `allow` | `allow` = no network restriction. `deny` = no network at all (`--network none` for containers). `egress` = internal network with a DNS-best-effort allowlist; the authoritative egress control is the ActPlane `connect` rules. |
-| `allow_egress` | list of hostnames | `[]` | Hostnames permitted when `network: egress`. ActPlane still has the final say. |
-| `env_passthrough` | list of env-var names | `["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]` | Host environment variables copied into the sandbox so the agent can authenticate. Only listed names cross, and only when set. |
-| `cpus` | number | unset | CPU quota for the sandbox, e.g. `4`. |
-| `memory` | string | unset | Memory limit, e.g. `"8G"`. |
-| `keep` | boolean | `false` | Keep the container around after exit for debugging. Off by default. |
-
-The run also sets `ACTIME_RUN_ID` and `ACTIME_WORKSPACE` inside the sandbox.
-
 ### `policy` -- policy plane (ActPlane)
 
-The policy plane writes the composed policy into the run directory
-(`policy.yaml` for the engine, `policy.dsl` for humans) and attaches
-`actplane` to the sandbox's host pid. In `enforce` mode a failure to start the
-policy plane aborts the run (fail closed). In `observe` mode it degrades.
+For `actime run`, the policy plane writes the composed policy into the run
+directory (`policy.yaml` for the engine, `policy.dsl` for humans) and launches
+the agent under `actplane run` so enforcement is launch-time. For
+`actime attach`, it attaches `actplane` to the target's host pid. In `enforce`
+mode a failure to start the policy plane aborts the run (fail closed). In
+`observe` mode it degrades.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `mode` | enum | `enforce` | `off` = plane disabled. `observe` = log violations, never block. `enforce` = apply effects (notify / block / kill); fail closed on attach error. |
 | `packs` | list of pack names | `["coding-agent-baseline"]` | Built-in packs shipped under `policies/` and embedded in the binary: `coding-agent-baseline`, `no-vcs-write`, `no-secret-egress`. |
 | `files` | list of paths | `[]` | Extra ActPlane policy files, merged on top of the packs. |
-| `feedback` | boolean | `true` | Whether ActPlane should deliver the rule's `because` text to the agent as corrective feedback. In 0.1.0 the generated `policy.yaml` always contains the feedback block; `false` is recorded and shown as `feedback off` in the report but does not yet remove it. |
+| `feedback` | boolean | `true` | Whether ActPlane should deliver the rule's `because` text to the agent as corrective feedback. In 0.1.0 the generated `policy.yaml` always contains the feedback block; `false` is recorded and shown as `feedback off` in the plane status but does not yet remove it. |
 
 `${WORKSPACE}` in policy files is substituted once, when the policy is
-composed, with the workspace path as the agent sees it (`/workspace` in a
-container, the real path otherwise).
+composed, with the workspace path as the agent sees it — the real host path
+for `actime run`, or the guest path when Actime runs inside a container
+(deployment B). Use it so the same policy file works in both.
 
 ### `evidence` -- evidence plane (AgentSight)
 
-The evidence plane records what the agent actually did. In 0.1.0 Actime invokes
-it as `agentsight record --no-server --db <run-dir>/evidence.db` with
-`--binary-path <target>` (sandbox) or `--pid <host pid>` (host), and it is
-always fail-soft.
+The evidence plane records what the agent actually did. In 0.1.0 Actime
+invokes it as `agentsight record --no-server --db <run-dir>/evidence.db` with
+`--pid <host pid>`, or `--binary-path docker://…` / `k8s://…` when the target
+is a container or pod. It is always fail-soft.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -146,7 +117,8 @@ fallback).
 
 The history plane records the agent's session files and makes runs replayable
 via Akeep. It runs after the agent exits, with a hard timeout so a stuck vault
-can never hang the run.
+can never hang the run. `actime attach` never commits history; the plane shows
+`Disabled` with the reason `attach does not commit history`.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -162,14 +134,14 @@ can never hang the run.
 
 ## Profiles
 
-A profile is a preset base layer. Choose one with `profile:` in `actime.yaml` or
-`--profile` on the CLI. File values are merged over the profile.
+A profile is a preset base layer. Choose one with `profile:` in `actime.yaml`
+or `--profile` on the CLI. File values are merged over the profile.
 
-| Profile | Sandbox | Policy | Evidence | Network | Notes |
-|---------|---------|--------|----------|---------|-------|
-| `observe` | `auto` | `observe`, feedback off (nothing blocked) | on | `allow` | The onboarding default for a new team. Nothing is ever blocked. |
-| `balanced` (default) | `auto` | `enforce` with `coding-agent-baseline` | on | `allow` | Blocks destructive and exfiltration-shaped effects; allows normal development. |
-| `strict` | `auto`, but the run **fails** if only `host` is available | `enforce` with `coding-agent-baseline` + `no-vcs-write` + `no-secret-egress` | on, `export: [otlp]` | `egress` with an explicit allowlist (LLM APIs, package registries, github.com) | Also sets `limits.wall_clock: 4h`. Use for sensitive codebases and CI gates. |
+| Profile | Policy | Evidence | History | Notes |
+|---------|--------|----------|---------|-------|
+| `observe` | `observe`, `coding-agent-baseline`, feedback off (nothing blocked) | on | on | The onboarding default for a new team. Nothing is ever blocked. |
+| `balanced` (default) | `enforce`, `coding-agent-baseline`, feedback on | on | on | Blocks destructive and exfiltration-shaped effects; allows normal development. |
+| `strict` | `enforce`, `coding-agent-baseline` + `no-vcs-write` + `no-secret-egress`, feedback on | on, `export: [otlp]` (recorded; not yet wired to the engine in 0.1.0) | on | Also sets `limits.wall_clock: 4h`. Use for sensitive codebases and CI gates. |
 
 ## CLI overrides
 
@@ -180,9 +152,7 @@ else. First-file-wins for config, then these flags win on top.
 |------|--------------|--------|
 | `--config <FILE>` | (resolution layer 1) | Load config from this file instead of searching. |
 | `--profile P` | `profile` | Use profile `P` as the base layer (`observe` / `balanced` / `strict` / path). |
-| `--sandbox B` | `sandbox.backend` | Force backend `B` (`auto` / `docker` / `podman` / `bwrap` / `host`). |
-| `--policy MODE` | `policy.mode` | Force policy mode (`off` / `observe` / `enforce`). |
-| `--image <IMAGE>` | `sandbox.image` | Use this container image for the run. |
+| `--policy MODE` | `policy.mode` | Force policy mode (`off` / `observe` / `enforce`). Also on `actime attach`. |
 | `--no-evidence` | `evidence.enabled` | Set to `false`. |
 | `--no-history` | `history.enabled` | Set to `false`. |
 | `--timeout <DURATION>` | `limits.wall_clock` | Kill the run after this long, e.g. `30m` or `2h`. |
@@ -201,35 +171,34 @@ Beyond `run`, Actime exposes these commands (from
 [DESIGN.md §10](./DESIGN.md#10-cli-surface), checked against `--help`):
 
 ```
-actime init [--profile P] [--force] [--print]
-actime run [--sandbox B] [--policy MODE] [--image IMG] [--no-evidence]
-           [--no-history] [--fail-on-violation] [--timeout D] [--] <cmd>...
-actime shell [--sandbox B] [--image IMG]
-actime attach (--pid N | --comm NAME) [--policy MODE]
+actime init [--force] [--print]
+actime run [--policy MODE] [--no-evidence] [--no-history]
+           [--fail-on-violation] [--timeout D] -- <cmd>...
+actime attach (--pid N | --comm NAME | --container REF | --pod NS/POD)
+              [--policy MODE]
 actime status
 actime runs [--json] [--limit N]        # default limit 20
 actime report [RUN] [--json|--markdown] # RUN defaults to `latest`
 actime policy (list | show PACK | check | explain)
 actime keep (commit [-m MSG] | log | restore [RUN] [--to DIR])
-actime sandbox (info | build [--tag T] | pull)
 actime doctor [--json]
-actime demo [--sandbox B] [--policy MODE]   # policy defaults to enforce
 ```
 
 | Command | Purpose |
 |---------|---------|
 | `actime init` | Write a starter `actime.yaml` for a profile. `--force` overwrites, `--print` skips writing. |
-| `actime run -- <cmd>...` | The main entry point. Everything after `--` is the agent command. |
-| `actime shell` | Drop into an interactive shell inside a sandbox. Runs with the history plane off. |
-| `actime attach` | Attach the policy and evidence planes to an already-running process by pid or comm name. Post-hoc: it binds future events only, and the isolation plane is disabled. |
+| `actime run -- <cmd>...` | The main entry point. Everything after `--` is the agent command, run as a host child. No container is created. |
+| `actime attach` | Attach the policy and evidence planes to an already-running target: a host pid, a comm name, an existing Docker/Podman container, or an existing pod on this node. Post-hoc: it binds future events only, and never commits history. Actime never creates containers; a missing target is a clear error. |
 | `actime status` | List runs that are still in progress. |
 | `actime runs` | List recorded runs, newest first. `--json` for machines, `--limit N` to cap. |
 | `actime report` | Render a run's report. Accepts a run id or `latest`. `--json` or `--markdown`. |
 | `actime policy` | Inspect policy packs: `list`, `show PACK`, `check` (compile the configured policy without loading it), `explain` (what this kernel can enforce before the fact). `check` and `explain` call the installed `actplane` binary and need no privileges. |
-| `actime keep` | History operations: `commit` (with `-m MSG`), `log`, `restore RUN`. All three delegate to the installed `akeep` binary. |
-| `actime sandbox` | Sandbox image management: `info` (which backends are available and why), `build` (from `sandbox/Dockerfile` in a checkout), `pull` (the published image). |
-| `actime doctor` | Fail-soft environment check. `--json` for machines. Exits `0` with warnings, `1` if any check failed. |
-| `actime demo` | The bundled stand-in agent, end to end. Default policy mode is `enforce`, which fails closed without a working policy plane; `--policy observe` needs no agent, no root, and no Docker. |
+| `actime keep` | History operations: `commit` (with `-m MSG`), `log`, `restore RUN [--to DIR]`. All three delegate to the installed `akeep` binary. |
+| `actime doctor` | Fail-soft environment check, including which deployment position it detects. `--json` for machines. Exits `0` with warnings, `1` if any check failed. |
+
+There is no `sandbox` subcommand, no `--sandbox` flag, no `demo` command, and
+no `shell` command. Isolation is the user's responsibility; see
+[deployment.md](./deployment.md).
 
 ## Environment variables
 
@@ -245,16 +214,11 @@ Engines are resolved in this order: `PATH`, `$ACTIME_HOME/bin`, `~/.cargo/bin`.
 
 Minimal -- there is no file; `actime run -- claude` just works.
 
-Lock down a sensitive repo to `strict` and a custom image:
+Lock down a sensitive repo to `strict`:
 
 ```yaml
 version: 1
 profile: strict
-sandbox:
-  image: ghcr.io/your-org/actime-sandbox:1.0
-  allow_egress:
-    - api.anthropic.com
-    - github.com
 ```
 
 Observe-only onboarding with no blocking, custom time budget:
@@ -264,6 +228,18 @@ version: 1
 profile: observe
 limits:
   wall_clock: "1h"
+```
+
+A team policy file on top of the default pack:
+
+```yaml
+version: 1
+policy:
+  mode: enforce
+  packs:
+    - coding-agent-baseline
+  files:
+    - ./team-policy.dsl
 ```
 
 CI gate that fails the build on any policy violation:

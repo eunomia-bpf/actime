@@ -2,9 +2,10 @@
 
 This guide takes you from a fresh Linux machine to a real run report in about
 five minutes. Actime runs an **unmodified** coding agent and accounts for what
-it does across four planes: isolation, policy, evidence, history. The fastest
-proof is `actime demo --policy observe`, which needs no agent, no root, and no
-Docker.
+it does across three planes: policy, evidence, history. It never creates
+containers or sandboxes — it attaches to the process tree you already have.
+The fastest proof needs no agent, no root, and no Docker:
+`actime run --policy off --no-history -- /bin/echo hi`.
 
 > Contract reference: every field, flag, and behavior below is defined in
 > [docs/DESIGN.md](./DESIGN.md). This document only shows you how to use it.
@@ -31,39 +32,39 @@ cargo install --path crates/actime-cli
 
 ## 2. Check the machine
 
-`actime doctor` is fail-soft by design: on a fresh machine it warns that the
-three engines are not installed, and that is expected at this point. Real
-output from a machine with Docker but no engines and no root:
+`actime doctor` is fail-soft by design: it reports which planes your machine
+supports, and every warning carries its own fix line. Real output (on a
+machine with the engines installed but older than the minimum, and no root):
 
 ```text
 $ actime doctor
+ok    deployment                   running on a host (deployment A/C). Host-side attach is available ...
 ok    os                           Linux
 ok    kernel                       kernel 6.15.11-061511-generic (≥ 6.1)
 ok    btf                          /sys/kernel/btf/vmlinux present
 warn  cap_bpf                      neither root nor CAP_BPF; policy and evidence planes will disable
       → Run as root, or grant CAP_BPF (e.g. `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`), ...
-warn  actplane                     actplane not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
-      → cargo install actplane
-warn  agentsight                   agentsight not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
-      → cargo install agentsight
-warn  akeep                        akeep not found on PATH, ~/.local/share/actime/bin, or ~/.cargo/bin
-      → cargo install akeep
+warn  actplane                     actplane 0.1.5 at ~/.local/bin/actplane is below minimum 0.1.8
+      → cargo install actplane and ensure version ≥ 0.1.8
+warn  agentsight                   agentsight 0.2.45 at ~/.local/bin/agentsight is below minimum 0.2.60
+      → cargo install agentsight and ensure version ≥ 0.2.60
+ok    akeep                        akeep 0.2.0 at ~/.local/bin/akeep (≥ 0.2.0)
 ok    run_store                    writable at ~/.local/share/actime
-ok    config                       profile=balanced policy=enforce sandbox.backend=auto evidence=on history=on
-ok    sandbox: docker              docker: available (29.1.3)
-ok    sandbox: podman              podman: available (4.9.3)
-ok    sandbox: bwrap               bwrap: available (bubblewrap 0.9.0)
+ok    config                       profile=balanced policy=enforce evidence=on history=on
 
-0 check(s) failed, 4 warning(s). Actime still runs: unavailable planes degrade rather than stopping a run.
+0 check(s) failed, 3 warning(s). Actime still runs: unavailable planes degrade rather than stopping a run.
 ```
 
-Every warning carries its own fix line. `doctor` exits `0` when nothing failed
-(warnings are fine) and `1` when a check failed; `actime doctor --json` emits
-the same checks for tooling.
+`doctor` exits `0` when nothing failed (warnings are fine) and `1` when a
+check failed; `actime doctor --json` emits the same checks for tooling. The
+first check, `deployment`, names your
+[deployment position](./deployment.md) — on a plain host it tells you
+host-side attach is available; inside a container it warns that this is
+deployment B and reports which capabilities are missing.
 
 The three engines are separate projects. They are what give you kernel-level
 policy enforcement and evidence; without them Actime still runs the agent,
-isolates it, records the run, and writes a report.
+records the run, and writes a report.
 
 ```sh
 cargo install actplane     # policy plane  (≥ 0.1.8; needs root or CAP_BPF)
@@ -71,118 +72,76 @@ cargo install agentsight   # evidence plane (≥ 0.2.60; needs root or CAP_BPF)
 cargo install akeep        # history plane  (≥ 0.2.0; no privileges needed)
 ```
 
-## 3. The 30-second demo
+## 3. A first run — no privileges, no engines
 
-`actime demo` runs a bundled script that reads files, spawns subprocesses,
-opens a network connection, touches credential-shaped paths, and attempts one
-policy-violating action (`git push --force`), then prints the report.
-
-The demo's default policy mode is `enforce`, which **fails closed** when the
-policy plane cannot start (no `actplane`, or no root/`CAP_BPF`). For a first
-look with no privileges at all, use `observe`:
+The shortest path from nothing to a result:
 
 ```sh
-actime demo --policy observe
+actime run --policy off --no-history -- /bin/echo hi
 ```
 
-Real output on a machine with Docker but without the engines installed:
+Everything after `--` is the agent command. Real output:
 
 ```text
-note: running the bundled stand-in agent in /tmp/actime-demo-4178070
-actime  run 20260805-001728-bf7b   sandbox: docker   policy: observe   evidence: off
-warning: policy plane disabled: actplane is not installed; run `cargo install actplane`
-warning: evidence plane disabled: agentsight is not installed; run `cargo install agentsight`
+actime  run 20260805-124610-f7db   target: command   policy: off   evidence: on
+warning: policy plane disabled: policy.mode is off
 
-actime-demo-agent: pretending to be a coding agent in /workspace
-
-  read looking around the project
-  exec running subprocesses (git, grep, python)
-  write editing files
-  connect opening a network connection
-  read touching credential-shaped paths (policy: notify)
-  exec attempting: git push --force  (policy: kill)
-
-  note git push --force did not succeed (rc=128)
-  done demo agent finished
+hi
 
 Actime run report
 ------------------------------------------------------------------------
-  Run id:     20260805-001728-bf7b
+  Run id:     20260805-124610-f7db
   Agent:      command
-  Argv:       ./actime-demo-agent
-  Duration:   5.5s
+  Argv:       /bin/echo hi
+  Duration:   1.7s
   Exit code:  0
   Profile:    balanced
 
+Target
+------------------------------------------------------------------------
+  kind:       command
+  spec:       /bin/echo hi
+  host_pid:   3577921
+  note:       launched as a host child process
+
 Planes
 ------------------------------------------------------------------------
-  isolation  Active
-  policy     Disabled   actplane is not installed; run `cargo install actplane…
-  evidence   Disabled   agentsight is not installed; run `cargo install agen…
-  history    Disabled   akeep is not installed; run `cargo install akeep`
+  policy     Disabled   policy.mode is off
+  evidence   Degraded   agentsight produced no process/file/network observatio…
+  history    Disabled   history.enabled is false
 
 Summary
 ------------------------------------------------------------------------
   violations=0      blocked=0      killed=0
   processes=0       files_written=0     endpoints=0
   llm_calls=0       tokens_in=0        tokens_out=0
-  peak_rss=0 B  cpu=0.00s  duration=5.5s
-
-Policy violations (0)
-------------------------------------------------------------------------
-  (none)
-
-Next steps
-------------------------------------------------------------------------
-  • actime report 20260805-001728-bf7b --markdown
-  • actime report 20260805-001728-bf7b --json
-  • Plane `policy` was disabled (...); run `actime doctor` for fixes
+  peak_rss=0 B  cpu=0.00s  duration=1.7s
 ```
 
-Two things to know about the demo:
-
-- If the sandbox image is missing and Docker is the selected backend, the demo
-  falls back to `--sandbox host` with a warning, so it works on a machine that
-  has never pulled the image. Without Docker it uses bwrap or host directly.
-- With the engines installed and sufficient privileges, plain `actime demo`
-  runs the same script in `enforce` mode and the policy plane kills the
-  `git push --force` attempt; the report's violation table shows it.
+The point of this run is not the `echo` — it is that every `actime run`
+produces a manifest and a report, even when every plane is off or degraded,
+and each plane's state comes with the reason. Nothing in the exit path is
+conditional on a plane having worked.
 
 ## 4. Run a real agent
 
-Point Actime at any agent command. The agent runs **unmodified**:
+Point Actime at any agent command. The agent runs **unmodified**, as a host
+child in your real cwd and environment:
 
 ```sh
 actime run -- claude
 ```
 
-Everything after `--` is the agent command. Actime resolves the `balanced`
-profile by default, picks a sandbox backend automatically (Docker, then Podman,
-then Bubblewrap, then host), and runs the four planes.
+With no `actime.yaml`, Actime resolves the built-in `balanced` profile: policy
+`enforce` with the `coding-agent-baseline` pack, evidence on, history on. The
+policy and evidence planes need root or `CAP_BPF`. When you run unprivileged,
+Actime invokes the engines through `sudo` (never prompting in non-interactive
+sessions); without privileges those two planes degrade and the reason is
+recorded in the manifest. In `enforce` mode a policy plane that cannot start
+aborts the run instead of running unprotected.
 
-The first container run needs the sandbox image
-(`ghcr.io/eunomia-bpf/actime-sandbox:latest`):
-
-```sh
-actime sandbox pull      # pull the published image
-# or, from a source checkout:
-actime sandbox build     # build sandbox/Dockerfile locally
-```
-
-If the image is missing and cannot be pulled, `actime run` stops with an error
-naming the fixes (`actime sandbox build`, `actime sandbox pull`, `--image`);
-only the demo falls back to host automatically. Use
-`--sandbox bwrap` or `--sandbox host` to run without the image, or `--image`
-to point at your own.
-
-The policy and evidence planes need root or `CAP_BPF`. When you run
-unprivileged, Actime invokes the engines through `sudo` (never prompting in
-non-interactive sessions); without privileges those two planes degrade and the
-reason is recorded in the manifest. In `enforce` mode a policy plane that
-cannot start aborts the run instead of running unprotected.
-
-When the agent exits you get the report on the terminal. With all four planes
-active it looks like this (real output format; values depend on the run):
+With the engines installed and sufficient privileges, the report looks like
+this (illustrative; values depend on the run):
 
 ```text
 Actime run report
@@ -194,16 +153,22 @@ Actime run report
   Exit code:  0
   Profile:    balanced
 
+Target
+------------------------------------------------------------------------
+  kind:       command
+  spec:       claude -p add retry logic to the uploader and run the tests
+  host_pid:   4124801
+  note:       launched as a host child process
+
 Planes
 ------------------------------------------------------------------------
-  isolation  Active
   policy     Active
   evidence   Active
   history    Active
 
 Summary
 ------------------------------------------------------------------------
-  violations=2      blocked=0      killed=1
+  violations=2      blocked=0      killed=2
   processes=214     files_written=18    endpoints=6
   llm_calls=37      tokens_in=411995   tokens_out=9102
   peak_rss=1.9 GiB  cpu=221.00s  duration=4m12s
@@ -211,8 +176,8 @@ Summary
 Policy violations (2)
 ------------------------------------------------------------------------
   RULE                 EFFECT   TARGET                   REASON
-  credential-access    notify   /home/dev/.aws/credenti… The agent read cr…
   destructive-vcs      kill     /usr/bin/git             Force-pushing, ha…
+  mass-deletion        kill     /usr/bin/rm              Recursive deletio…
 
 Next steps
 ------------------------------------------------------------------------
@@ -230,7 +195,27 @@ actime run -- opencode
 actime run -- ./your-own-agent --flag arg
 ```
 
-## 5. Read the record
+## 5. Attach to something already running
+
+`actime run` launches a new process. `actime attach` binds the planes to one
+that already exists — including a container or pod that someone else created:
+
+```sh
+actime attach --comm claude              # newest process with this comm name
+actime attach --pid 4213                 # a specific host pid
+sudo actime attach --container agent-box # an existing Docker/Podman container
+sudo actime attach --pod default/agent-0 # an existing pod on this node
+```
+
+Actime never creates, starts, stops, or removes containers — `--container` and
+`--pod` only resolve targets that already exist. Attaching from the host to a
+container's process tree is
+[deployment position A](./deployment.md), the strongest tamper story: root
+inside the container cannot disable the recorder or edit the record. Attach
+binds future events only (nothing is reconstructed), holds until the target
+exits or you press Ctrl-C, and does not commit history.
+
+## 6. Read the record
 
 Every run produces a report in three forms. Use whichever fits your workflow:
 
@@ -250,9 +235,9 @@ The report is also written to disk as `report.md` in the run directory:
   report.md              # rendered on exit
   policy.yaml            # the ActPlane project file the engine loaded (policy plane)
   policy.dsl             # the composed policy, human-readable   (policy plane)
-  violations.jsonl       # one violation per line, appended live (policy plane)
+  violations.jsonl       # harvested policy violations           (policy plane)
   evidence.db            # AgentSight SQLite store               (evidence plane)
-  *-engine.log, history.log   # engine stderr and plane logs, when a plane ran
+  *-engine.log           # engine stderr, when a plane was attempted
 ```
 
 Set `ACTIME_HOME` to put the run store somewhere else.
@@ -276,7 +261,7 @@ actime keep restore 20260804-153012-a3f1 --to ./restored
 `keep restore` works for runs whose history plane committed; the commit id is
 in the manifest as `akeep_commit`.
 
-## 6. When a plane is degraded
+## 7. When a plane is degraded
 
 Actime never fails a run just because a plane is missing. Instead the plane
 degrades, the report says so, and `doctor` tells you how to fix it. The
@@ -296,19 +281,17 @@ Common reasons and fixes:
 - **policy disabled: `actplane is not installed; run 'cargo install actplane'`**.
   The agent ran with no kernel enforcement; nothing was blocked. Install the
   engine and re-run `actime doctor`. The policy plane also needs root or
-  `CAP_BPF`: Actime attaches the eBPF programs from the host via `sudo` when
-  needed, or you can grant the capability once with
+  `CAP_BPF`: Actime launches the engine via `sudo` when needed, or you can
+  grant the capability once with
   `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`.
-- **policy disabled: `actplane 0.1.5 is below 0.1.8`** -- the installed engine
+- **policy disabled: `actplane 0.1.5 is below 0.1.8`** — the installed engine
   is too old. `cargo install actplane` and check `actime doctor` again.
-- **evidence disabled: `agentsight is not installed`** -- Actime still records
+- **evidence disabled: `agentsight is not installed`** — Actime still records
   argv, exit code, and duration (the process-level fallback), but not the full
   process/file/network trace. Fix: `cargo install agentsight`.
-- **isolation degraded: `host mode: no isolation`** -- the run used the `host`
-  backend, so the agent ran as a normal child process with no isolation. This
-  happens when you pass `--sandbox host`, or when `auto` found no Docker,
-  Podman, or Bubblewrap. The `strict` profile refuses to run in this state.
-- **history degraded: `akeep commit failed: ...`** -- the run finished but the
+- **history disabled: `attach does not commit history`** — expected for
+  `actime attach`; there is no run exit to commit on.
+- **history degraded: `akeep commit failed: ...`** — the run finished but the
   session history was not committed; the reason comes from `akeep` and the run
   record is otherwise complete.
 
@@ -322,9 +305,9 @@ actime report latest --markdown
 
 ## Next
 
-- [configuration.md](./configuration.md) -- every field of `actime.yaml`, the
+- [deployment.md](./deployment.md) — outside the sandbox, inside it, or no
+  sandbox: the three positions and their real tamper stories.
+- [configuration.md](./configuration.md) — every field of `actime.yaml`, the
   resolution order, the three profiles, and every CLI override.
-- [sandbox.md](./sandbox.md) -- the four backends, why the eBPF planes attach
-  from the host, and how network isolation actually works.
-- [faq.md](./faq.md) -- root, Docker, macOS, telemetry, and uninstall.
-- [DESIGN.md](./DESIGN.md) -- the implementation contract.
+- [faq.md](./faq.md) — root, containers, macOS, telemetry, and uninstall.
+- [DESIGN.md](./DESIGN.md) — the implementation contract.

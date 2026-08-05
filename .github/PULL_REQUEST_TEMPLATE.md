@@ -14,7 +14,6 @@ docs/CONTRIBUTING.md (if present) for conventions. -->
 
 <!-- Check the ones that apply. -->
 
-- [ ] isolation (sandbox backends: docker / podman / bwrap / host)
 - [ ] policy (ActPlane integration, policy packs)
 - [ ] evidence (AgentSight integration, evidence collection/export)
 - [ ] history (Akeep integration)
@@ -35,13 +34,13 @@ If yes, summarize the contract change:
 
 ## How was it tested?
 
-<!-- Commands you ran. New tests added. Note if `actime demo` still passes. -->
+<!-- Commands you ran. New tests added. Note if the unprivileged smoke run still passes. -->
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace`
 - [ ] `actime doctor` is clean on my machine
-- [ ] `actime demo` still runs end to end
+- [ ] `actime run --policy off --no-history -- /bin/echo hi` still runs end to end
 
 ## Checklist
 

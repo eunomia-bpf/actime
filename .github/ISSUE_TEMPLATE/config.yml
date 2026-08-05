@@ -10,7 +10,7 @@ contact_links:
     url: https://github.com/eunomia-bpf/actime/tree/main/docs
     about: |
       Read docs/DESIGN.md (the implementation contract), docs/quickstart.md,
-      docs/configuration.md, docs/sandbox.md, and docs/faq.md before opening
+      docs/deployment.md, docs/configuration.md, and docs/faq.md before opening
       an issue.
   - name: Question or discussion
     url: https://github.com/eunomia-bpf/actime/discussions

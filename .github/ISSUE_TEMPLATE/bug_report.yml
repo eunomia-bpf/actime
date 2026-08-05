@@ -29,16 +29,27 @@ body:
       required: true
 
   - type: dropdown
-    id: backend
+    id: deployment
     attributes:
-      label: Sandbox backend
-      description: What `actime` actually selected. Check `actime doctor`.
+      label: Deployment position
+      description: Where Actime is running relative to any sandbox. Check the first line of `actime doctor`.
       options:
-        - auto (resolved below)
-        - docker
-        - podman
-        - bwrap
-        - host (isolation plane off)
+        - host (Actime on the host; deployment A/C)
+        - in-container (Actime inside the sandbox; deployment B)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: attach-target
+    attributes:
+      label: Attach target
+      description: What the planes attached to.
+      options:
+        - command (actime run -- <cmd>)
+        - pid (actime attach --pid)
+        - comm (actime attach --comm)
+        - container (actime attach --container)
+        - pod (actime attach --pod)
     validations:
       required: true
 
@@ -74,8 +85,8 @@ body:
       label: "`actime doctor --json` output"
       description: |
         Run `actime doctor --json` and paste the full output. This captures
-        which planes were detected, engine versions, and the resolved sandbox
-        backend. If `actime` will not start, paste any error verbatim.
+        which deployment position was detected, which planes were available,
+        and engine versions. If `actime` will not start, paste any error verbatim.
       render: shell
     validations:
       required: true

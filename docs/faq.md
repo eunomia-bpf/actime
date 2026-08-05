@@ -5,55 +5,71 @@ Short, direct answers. Where a claim is a contract, the
 
 ## Does Actime need root?
 
-No. The Actime binary, the sandbox, and the history plane all run unprivileged.
+No. The Actime binary and the history plane run unprivileged.
 `actime run -- claude` works as a normal user.
 
-Only the **policy** (ActPlane) and **evidence** (AgentSight) planes need root or
-`CAP_BPF`, because they load eBPF programs into the kernel. When you run
+Only the **policy** (ActPlane) and **evidence** (AgentSight) planes need root
+or `CAP_BPF`, because they load eBPF programs into the kernel. When you run
 unprivileged, Actime launches the engines through `sudo` (interactively it may
 ask for your password once; in non-interactive sessions it uses `sudo -n` and
 fails fast instead of hanging). If the privileges are not there, those two
-planes degrade to `Disabled` with the reason in the report, while isolation,
-history, and the process-level evidence fallback keep working. One exception:
-in `policy.mode: enforce` a policy plane that cannot start aborts the run
+planes degrade to `Disabled` with the reason in the report, while history and
+the process-level evidence fallback keep working. One exception: in
+`policy.mode: enforce` a policy plane that cannot start aborts the run
 (fail closed). Run `actime doctor` to see exactly which planes are available on
 your machine; it prints the `setcap` command that grants the engines
 `CAP_BPF`/`CAP_PERFMON` if you prefer not to use sudo.
 
+## Where does Actime sit relative to my sandbox?
+
+Wherever you put it — that is a deployment choice, not an architectural
+constraint. Actime never creates, starts, stops, or removes containers. Three
+positions, all supported:
+
+- **Outside the sandbox** (position A): Actime on the host, attached to an
+  existing container or pod with `actime attach --container REF` /
+  `--pod NS/POD`. Strongest tamper story: root inside the container cannot
+  disable the recorder or edit the record. Needs host root or `CAP_BPF`.
+- **Inside the sandbox** (position B): Actime in the same container/VM as the
+  agent, running `actime run -- claude`. The only option on platforms where you
+  do not own the host (E2B, Daytona, AWS AgentCore, managed Kubernetes).
+  Weaker tamper story: root inside the container can interfere, and we say so
+  plainly. Needs `CAP_BPF` granted to the container.
+- **No sandbox at all** (position C): a plain process on a machine, the common
+  workstation case.
+
+The full setup for each — including the exact `docker run --cap-add`
+incantation for position B — is in [deployment.md](./deployment.md). What is
+always true, in every position, is that Actime enforces and observes below the
+tool layer, at the syscall boundary.
+
+## Does Actime work with E2B, Daytona, or AWS AgentCore?
+
+Yes — that is deployment position B. You cannot attach from a host you do not
+own, so Actime runs inside the sandbox, alongside the agent. Install it in the
+sandbox image (or have the vendor ship it), grant the container `CAP_BPF`
+(often plus `CAP_PERFMON`; `CAP_SYS_ADMIN` on kernels older than 5.8), and run
+the agent under `actime run`. See [deployment.md](./deployment.md) for the
+exact setup, and read the tamper-story section there before you rely on the
+record for incident response.
+
 ## Does it work without Docker?
 
-Yes. When `sandbox.backend: auto` (the default) Actime probes in order:
-**Docker**, then **Podman**, then **Bubblewrap**, then **host**. If you have no
-container runtime it uses the Bubblewrap namespace sandbox, and if that is
-missing too, the `host` backend. Two honest caveats:
-
-- On `bwrap`, no host pid exists before the agent starts, so in 0.1.0 the
-  policy and evidence planes are disabled there. You still get isolation,
-  history, and the process-level record.
-- The `docker`/`podman` backends need the sandbox image on first use
-  (`actime sandbox pull`, or `actime sandbox build` from a checkout).
-
-`actime demo --policy observe` runs with no agent, no root, and no Docker.
-Plain `actime demo` defaults to `enforce` and fails closed if the policy plane
-cannot start.
-
-The `strict` profile is the one exception to graceful fallback: it requires a
-real sandbox and fails rather than run on `host`.
+Yes. Actime does not use Docker to run anything — `actime run` launches the
+agent as a plain host child. Docker, Podman, or `kubectl` are only needed to
+*resolve* attach targets: `actime attach --container` uses
+`docker inspect` / `podman inspect`, and `--pod` uses `kubectl`. If you never
+attach to containers, you never need a container runtime.
 
 ## Does Actime slow the agent down?
 
 Not in the path that matters. Actime does **not** proxy LLM traffic or sit
 between the agent and its model (that is an explicit non-goal). Agent network
-calls go direct. The costs are:
-
-- **Sandbox startup** -- pulling an image the first time, then sub-second
-  container/bwrap bring-up for subsequent runs. Cached images are fast.
-- **eBPF probes** -- the policy and evidence planes attach per-syscall probes in
-  the kernel's fast path. Evidence is aggregated and written to the run
-  directory, not copied through Actime on the hot path.
-
-For a typical coding session, sandbox startup is amortized over minutes of agent
-work, and the per-syscall overhead is not noticeable relative to model latency.
+calls go direct. The only cost is the eBPF probes: the policy and evidence
+planes attach per-syscall programs in the kernel's fast path, and evidence is
+aggregated and written to the run directory, not copied through Actime on the
+hot path. For a typical coding session the per-syscall overhead is not
+noticeable relative to model latency.
 
 ## Does Actime send anything to the network?
 
@@ -64,8 +80,7 @@ under `~/.local/share/actime/runs/<run-id>/` on your machine (override with
 The `evidence.export` field is reserved for optional sinks such as `otlp`; in
 0.1.0 it is recorded in the effective config but not yet wired to the evidence
 engine, so nothing leaves the box. The only network traffic on the machine is
-the agent's own, which you control via the sandbox network mode and the policy
-plane.
+the agent's own, which you control with the policy plane's `connect` rules.
 
 ## How does Actime relate to ActPlane, AgentSight, and Akeep?
 
@@ -97,25 +112,26 @@ actime run -- opencode
 actime run -- ./your-own-agent --flag arg
 ```
 
-The default sandbox image preinstalls Claude Code, Codex, and Gemini CLI as a
-convenience, but they are not required. `actime demo` uses a bundled script, so
-it needs no agent at all.
+The shipped policy packs label `claude`, `codex`, `gemini`, `opencode`,
+`openclaw`, `aider`, and `cursor-agent` processes as agent lineage; add your
+own `source AGENT = exec "**/your-agent"` line in a policy file for anything
+else (see [policies.md](./policies.md)).
 
 ## What about macOS?
 
 Not supported. The prebuilt binaries are Linux-only (the installer refuses
 other platforms), and the **policy and evidence planes are Linux-only** because
-they are eBPF programs that need a Linux host kernel to attach to. Use a Linux
-machine or VM.
+they are eBPF programs that need a Linux kernel to attach to. Use a Linux
+machine, VM, or container.
 
 ## Where is my data stored?
 
 Under two directories:
 
-- `~/.local/share/actime/runs/<run-id>/` -- one directory per run, holding the
+- `~/.local/share/actime/runs/<run-id>/` — one directory per run, holding the
   manifest, effective config, the policy that was loaded, violations, evidence,
   engine logs, and the rendered report. Override the root with `ACTIME_HOME`.
-- `~/.config/actime/actime.yaml` -- your user-level config (one of the
+- `~/.config/actime/actime.yaml` — your user-level config (one of the
   resolution layers).
 
 List runs with `actime runs`, inspect one with `actime report <id>`, and see
@@ -161,7 +177,9 @@ so a CI step fails cleanly when the agent steps out of bounds. Otherwise the
 exit code of `actime run` is the agent's own exit code. Actime never prompts
 for a sudo password when stdin is not a terminal (and never when
 `ACTIME_NONINTERACTIVE` or `NO_COLOR` is set), so a CI job cannot hang on a
-password prompt; without passwordless sudo the eBPF planes simply degrade.
+password prompt; without passwordless sudo the eBPF planes simply degrade. On a
+CI runner you own, position A applies: the runner is the host, and the record
+is outside anything the agent can reach.
 
 ## How do I uninstall?
 
@@ -177,12 +195,6 @@ If you installed the optional engines, remove them too:
 
 ```sh
 cargo uninstall actplane agentsight akeep
-```
-
-Optionally remove the sandbox image:
-
-```sh
-docker rmi ghcr.io/eunomia-bpf/actime-sandbox:latest
 ```
 
 That removes everything Actime put on your machine.
