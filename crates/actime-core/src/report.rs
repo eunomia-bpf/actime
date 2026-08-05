@@ -214,10 +214,23 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
     if !run.manifest.unenforceable_rules.is_empty() {
         let _ = writeln!(out, "## Unenforceable rules");
         let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "These rules were in the composed policy but this host's ActPlane engine cannot install them. The observe/enforce run did not watch for them."
-        );
+        let refused = run
+            .manifest
+            .target
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("refused before agent launch"));
+        if refused {
+            let _ = writeln!(
+                out,
+                "These rules were in the composed policy but this host's ActPlane engine cannot install them. **The run was refused before the agent started** (fail-closed enforce)."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "These rules were in the composed policy but this host's ActPlane engine cannot install them. The observe/enforce run did not watch for them."
+            );
+        }
         let _ = writeln!(out);
         let _ = writeln!(out, "| Rule | Effect | Reason |");
         let _ = writeln!(out, "|------|--------|--------|");
@@ -382,6 +395,20 @@ fn next_steps(run: &Run, ev: &Evidence) -> Vec<String> {
 
     steps.push(format!("actime report {id} --markdown"));
     steps.push(format!("actime report {id} --json"));
+
+    let refused = run
+        .manifest
+        .target
+        .note
+        .as_deref()
+        .is_some_and(|n| n.contains("refused before agent launch"));
+    if refused {
+        steps.push(
+            "This run was refused before the agent started. Drop unenforceable packs, \
+             use `--policy observe`, or run `actime policy check` / `actime doctor`."
+                .into(),
+        );
+    }
 
     if ev.summary.blocked > 0 || ev.summary.killed > 0 {
         steps.push(format!(

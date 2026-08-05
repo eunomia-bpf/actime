@@ -105,8 +105,9 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
     let exit = match outcome {
         Ok(exit) => exit,
         Err(e) => {
-            run.manifest.ended_at = Some(now_rfc3339());
-            let _ = run.save_manifest();
+            // A refusal or orchestration error is still an auditable event:
+            // finalize so `actime runs` never shows a half-written live run.
+            finalize_aborted(ctx, &mut run, 1, &abort_reason(&e));
             return Err(e);
         }
     };
@@ -144,9 +145,26 @@ pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
         note: Some("attached to an already-running process tree; Actime did not create it".into()),
     };
 
+    match attach_inner(ctx, &mut run, &cfg, &components, &resolved, &cwd) {
+        Ok(code) => Ok(code),
+        Err(e) => {
+            finalize_aborted(ctx, &mut run, 1, &abort_reason(&e));
+            Err(e)
+        }
+    }
+}
+
+fn attach_inner(
+    ctx: &Ctx,
+    run: &mut Run,
+    cfg: &Config,
+    components: &Components,
+    resolved: &ResolvedTarget,
+    cwd: &Path,
+) -> Result<i32> {
     let workspace = cwd.display().to_string();
-    let dsl = compose(&cfg, &workspace)?;
-    let packs = packs_label(&cfg);
+    let dsl = compose(cfg, &workspace)?;
+    let packs = packs_label(cfg);
     let actplane_dir = run.dir.join("actplane");
     let _ = std::fs::create_dir_all(&actplane_dir);
 
@@ -297,10 +315,10 @@ pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
     // Engines must exit fully before harvest so events flush to disk.
     policy.stop();
     evidence.stop();
-    harvest_actplane_events(&run);
+    harvest_actplane_events(run);
 
     run.manifest.summary.duration_seconds = started.elapsed().as_secs_f64();
-    finish(ctx, &mut run, 0, false)
+    finish(ctx, run, 0, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1573,63 @@ fn finish(ctx: &Ctx, run: &mut Run, exit: i32, fail_on_violation: bool) -> Resul
         return Ok(crate::EXIT_VIOLATION);
     }
     Ok(exit)
+}
+
+/// First line of an error — short enough for `target.note` and plane reasons.
+fn abort_reason(err: &anyhow::Error) -> String {
+    let full = format!("{err:#}");
+    full.lines()
+        .next()
+        .unwrap_or("run aborted")
+        .trim()
+        .to_string()
+}
+
+/// Finalize a run that was refused or aborted before a normal agent exit.
+///
+/// A refusal is an auditable event: the run directory stays, but the record
+/// must not look like a crash mid-flight (`exit_code` null, no `ended_at`,
+/// planes stuck at "not started" with no explanation).
+fn finalize_aborted(ctx: &Ctx, run: &mut Run, exit: i32, reason: &str) {
+    // `finish` already closed this run (e.g. attach success path then a late
+    // error while writing the report) — do not clobber a complete record.
+    if run.manifest.exit_code.is_some() && run.manifest.ended_at.is_some() {
+        return;
+    }
+
+    run.manifest.exit_code = Some(exit);
+    run.manifest.ended_at = Some(now_rfc3339());
+
+    let refused = "not started: run refused before agent launch";
+    for plane in [
+        &mut run.manifest.planes.policy,
+        &mut run.manifest.planes.evidence,
+        &mut run.manifest.planes.history,
+    ] {
+        if matches!(plane, PlaneState::Disabled(s) if s == "not started") {
+            *plane = PlaneState::Disabled(refused.into());
+        }
+    }
+
+    let note = format!("refused before agent launch — {reason}");
+    run.manifest.target.note = Some(match run.manifest.target.note.take() {
+        Some(existing) if !existing.is_empty() && !existing.contains("refused before") => {
+            format!("{existing}; {note}")
+        }
+        Some(existing) if !existing.is_empty() => existing,
+        _ => note,
+    });
+
+    let _ = run.save_manifest();
+
+    let ev = Evidence::collect(run).unwrap_or_default();
+    let md = report::render_markdown(run, &ev);
+    let _ = std::fs::write(run.report_path(), &md);
+
+    if !ctx.quiet {
+        eprintln!();
+        eprintln!("{}", report::render_text(run, &ev, ui::width()));
+    }
 }
 
 // ---------------------------------------------------------------------------

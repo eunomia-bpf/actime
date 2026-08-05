@@ -709,10 +709,8 @@ fn run_without_command_fails() {
 
 #[test]
 fn run_enforce_information_flow_fails_closed() {
-    // BUG: fail-closed enforce still creates a run directory with exit_code
-    // null and planes mostly "not started" (agent never launched). That is
-    // intentional enough to leave alone here; the suite only requires exit 1
-    // and that the agent did not run.
+    // Fail-closed enforce must refuse the agent and leave an unambiguous
+    // finished run record (refusal is auditable, not a half-written crash).
     let home = tempfile::tempdir().expect("tempdir");
     write_config_with_packs(home.path(), &["information-flow"]);
 
@@ -777,6 +775,63 @@ fn run_enforce_information_flow_fails_closed() {
             "without actplane, still expect unenforceable-rule messaging:\n{msg}"
         );
     }
+
+    // Auditable refusal record: finished run, exit 1, refused note, report.md.
+    let dirs = list_run_dirs(home.path());
+    assert_eq!(
+        dirs.len(),
+        1,
+        "fail-closed enforce must leave exactly one run dir, got {dirs:?}"
+    );
+    let run_dir = &dirs[0];
+    assert!(
+        run_dir.join("manifest.json").is_file(),
+        "manifest.json missing after fail-closed refusal"
+    );
+    assert!(
+        run_dir.join("report.md").is_file(),
+        "report.md missing after fail-closed refusal"
+    );
+
+    let m = read_manifest(run_dir);
+    assert_eq!(
+        m["exit_code"], 1,
+        "refused run must have exit_code 1, got {}",
+        m["exit_code"]
+    );
+    assert!(
+        m["ended_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "refused run must set ended_at so it is not listed as live: {}",
+        m["ended_at"]
+    );
+    let note = m["target"]["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("refused before agent launch"),
+        "target.note must say the agent was never launched:\n{note}"
+    );
+    assert!(
+        m.get("unenforceable_rules")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        "manifest must list unenforceable_rules: {}",
+        m["unenforceable_rules"]
+    );
+
+    let report = std::fs::read_to_string(run_dir.join("report.md")).expect("report.md");
+    assert!(
+        report.to_ascii_lowercase().contains("refused") || report.contains("Unenforceable"),
+        "report.md must describe the refusal:\n{report}"
+    );
+
+    // Must not look like an in-progress run.
+    let status = Cmd::new(home.path()).arg("status").run();
+    status.assert_ok("status after fail-closed");
+    let status_text = status.combined().to_ascii_lowercase();
+    assert!(
+        status_text.contains("no runs in progress") || status_text.contains("no run"),
+        "refused run must not appear as in-progress:\n{}",
+        status.combined()
+    );
 }
 
 #[test]

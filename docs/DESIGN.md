@@ -291,8 +291,9 @@ No container is created, ever.
 4. **Rule enforceability (before any engine start):** resolve which rules in
    the composed policy this host's ActPlane engine can actually install. See
    §7.1. In `enforce` mode, if any requested rule is not enforceable, **fail
-   closed before launching the agent**. In `observe` mode, proceed but record
-   unenforceable rules in the manifest and report.
+   closed before launching the agent**, then **finalize the run record** as a
+   refusal (see below). In `observe` mode, proceed but record unenforceable
+   rules in the manifest and report.
 5. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
    wrap the agent with `actplane --policy <file> run -- <argv>` (launch-time
    enforcement; the engine installs the composed policy for that run).
@@ -330,7 +331,14 @@ Before a run, Actime:
 **`--policy enforce`:** if any rule is not enforceable, abort before the agent
 starts, list the rules and missing engine features, and tell the operator to
 drop those packs or use `--policy observe`. Silent partial enforcement is the
-worst outcome.
+worst outcome. The run directory is still kept and **finalized as a refusal**:
+`ended_at` set, `exit_code` 1, `target.note` containing
+`refused before agent launch`, planes that never started labeled
+`not started: run refused before agent launch` (policy may already be
+`Disabled` with the unenforceable-count reason), `unenforceable_rules` on the
+manifest, and `report.md` rendered. A refusal is an auditable event; it must
+not look like a crash mid-flight (`exit_code` null / no `ended_at` /
+"in progress" in `actime status`).
 
 **`--policy observe`:** proceed; store unenforceable rules on the manifest and
 print them in the report so the operator knows the run did not watch for them.
@@ -363,8 +371,9 @@ load.
 | kernel < 5.10 | policy plane disabled with the kernel version in the reason |
 
 `actime run` always produces a manifest and a report, even when only the
-process-level fallback ran. Nothing in the exit path may be conditional on a
-plane having worked.
+process-level fallback ran, and even when the run was refused before the
+agent started. Nothing in the exit path may be conditional on a plane having
+worked.
 
 ## 9. Profiles
 
@@ -406,7 +415,8 @@ no `shell` command. Isolation is the user's responsibility.
   kernel — none of these may abort a run. They degrade a plane and record the
   reason in the manifest. The one exception is `policy.mode: enforce`.
 - **Every run produces a manifest and a report**, even when only the
-  process-level fallback ran.
+  process-level fallback ran, and even when `enforce` refused before the
+  agent started (finalized refusal record, not a half-written directory).
 - **Never create containers.** `attach --container` / `--pod` only resolve
   already-existing targets.
 - **Harvest after engine exit.** Violations already produced by the kernel must
