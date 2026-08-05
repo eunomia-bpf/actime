@@ -31,6 +31,7 @@
 pub mod components;
 pub mod config;
 pub mod doctor;
+pub mod enforceability;
 pub mod evidence;
 pub mod report;
 pub mod run;
@@ -43,6 +44,10 @@ pub use config::{
     LimitsConfig, PolicyConfig, PolicyMode,
 };
 pub use doctor::{run_checks, Check, CheckStatus};
+pub use enforceability::{
+    assess_compile_json, assess_dsl, engine_supported_features, unenforceable_only,
+    RuleEnforceability, ENGINE_SUPPORTED_0_1_8,
+};
 pub use evidence::{Evidence, TimelineEntry, Violation, TIMELINE_CAP};
 pub use report::{render_json, render_markdown, render_text};
 pub use run::{

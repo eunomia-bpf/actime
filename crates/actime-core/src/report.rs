@@ -83,6 +83,27 @@ pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
     render_summary_text(&mut out, &ev.summary);
     let _ = writeln!(out);
 
+    // --- Unenforceable rules (honest observe / mixed packs) ---
+    if !run.manifest.unenforceable_rules.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unenforceable rules ({})",
+            run.manifest.unenforceable_rules.len()
+        );
+        let _ = writeln!(out, "{rule}");
+        let _ = writeln!(out, "  {:<24} {:<8} REASON", "RULE", "EFFECT");
+        for r in &run.manifest.unenforceable_rules {
+            let _ = writeln!(
+                out,
+                "  {:<24} {:<8} {}",
+                truncate(&r.name, 24),
+                truncate(&r.effect, 8),
+                truncate(&r.reason, width.saturating_sub(36))
+            );
+        }
+        let _ = writeln!(out);
+    }
+
     // --- Violations table ---
     let _ = writeln!(out, "Policy violations ({})", ev.violations.len());
     let _ = writeln!(out, "{rule}");
@@ -189,6 +210,28 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
     let _ = writeln!(out, "| Peak RSS | {} |", format_bytes(s.peak_rss_bytes));
     let _ = writeln!(out, "| CPU seconds | {:.2} |", s.cpu_seconds);
     let _ = writeln!(out);
+
+    if !run.manifest.unenforceable_rules.is_empty() {
+        let _ = writeln!(out, "## Unenforceable rules");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "These rules were in the composed policy but this host's ActPlane engine cannot install them. The observe/enforce run did not watch for them."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Rule | Effect | Reason |");
+        let _ = writeln!(out, "|------|--------|--------|");
+        for r in &run.manifest.unenforceable_rules {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
+                escape_md(&r.name),
+                escape_md(&r.effect),
+                escape_md(&truncate(&r.reason, 96))
+            );
+        }
+        let _ = writeln!(out);
+    }
 
     let _ = writeln!(out, "## Policy violations");
     let _ = writeln!(out);

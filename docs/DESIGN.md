@@ -288,7 +288,12 @@ No container is created, ever.
 1. Resolve config, profile, CLI overrides. Resolve components.
 2. `RunStore::create` → run directory, write effective `actime.yaml`.
 3. Compose policy with `${WORKSPACE}` = the real host cwd.
-4. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
+4. **Rule enforceability (before any engine start):** resolve which rules in
+   the composed policy this host's ActPlane engine can actually install. See
+   §7.1. In `enforce` mode, if any requested rule is not enforceable, **fail
+   closed before launching the agent**. In `observe` mode, proceed but record
+   unenforceable rules in the manifest and report.
+5. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
    wrap the agent with `actplane --policy <file> run -- <argv>` (launch-time
    enforcement; the engine installs the composed policy for that run).
    Outcome is only **Active** when the policy is verifiably installed: if the
@@ -296,13 +301,43 @@ No container is created, ever.
    plane is reclassified to **Disabled** with the engine's reason. In
    `enforce` mode a failure to start *or* install aborts the run (fail closed)
    rather than reporting Active while nothing was constrained.
-5. **Evidence plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
+6. **Evidence plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
    once the child exists. Always fail-soft.
-6. Wait for the agent / wrap. Enforce `limits.wall_clock`. Prefer natural
+7. Wait for the agent / wrap. Enforce `limits.wall_clock`. Prefer natural
    engine exit so events flush; then SIGTERM with a long grace; then SIGKILL.
-7. On exit: stop engines (bounded), **harvest violations only after engines
+8. On exit: stop engines (bounded), **harvest violations only after engines
    have exited**, collect `Evidence`, update the manifest, run `akeep commit`
    when history is enabled, render `report.md`, print the summary.
+
+### 7.1 Rule enforceability (host property)
+
+The engine's supported rule classes are a **host property**, not a pack
+property. Released ActPlane 0.1.8 pins a host-wide eBPF singleton whose feature
+budget admits exec sinks (and plain connect) but **not** open/write sink rule
+classes or path contains/suffix matchers. A policy that needs those features
+fails the whole install — Actime must never report `policy Active` for a
+partial or failed install.
+
+Before a run, Actime:
+
+1. Composes the policy (`${WORKSPACE}` substituted).
+2. Calls `actplane compile --json` when available (per-clause `kernel_op`,
+   `target_kind`, path patterns, file sources).
+3. Combines that shape with the known engine feature budget for this ActPlane
+   version and marks each rule `enforceable: bool` + `reason`.
+4. Surfaces the table via `actime policy check` (no privileges required).
+
+**`--policy enforce`:** if any rule is not enforceable, abort before the agent
+starts, list the rules and missing engine features, and tell the operator to
+drop those packs or use `--policy observe`. Silent partial enforcement is the
+worst outcome.
+
+**`--policy observe`:** proceed; store unenforceable rules on the manifest and
+print them in the report so the operator knows the run did not watch for them.
+
+**Install failure after launch:** if the engine log still reports a hard
+install error, reclassify the policy plane to **Disabled** with the engine's
+reason — never leave `Active` when nothing was constrained.
 
 The exit code of `actime run` is the agent's exit code when known.
 `--fail-on-violation` makes any `kill`/`block` violation force exit code 3.
@@ -338,9 +373,11 @@ plane having worked.
 - **balanced** (default) — policy `enforce` with the `coding-agent-baseline`
   pack, evidence on, history on. Blocks destructive and exfiltration-shaped
   effects, allows normal development.
-- **strict** — policy `enforce` with `coding-agent-baseline` + `no-vcs-write` +
-  `no-secret-egress`, evidence on with `otlp` export, optional wall-clock
-  limit. Fail closed on the policy plane.
+- **strict** — policy `enforce` with `coding-agent-baseline` + `no-vcs-write`
+  (exec-based packs that released ActPlane can install), evidence on with
+  `otlp` export, optional wall-clock limit. Fail closed on the policy plane.
+  The `information-flow` pack (file sinks, secret labels) is shipped but not
+  part of any default profile until the engine enables those rule classes.
 
 ## 10. CLI surface
 

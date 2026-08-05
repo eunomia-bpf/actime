@@ -3,6 +3,11 @@
 # For CI runners, shared machines, and regulated repositories. Fail closed on
 # the policy plane: enforce must load or the run aborts. Evidence is exported
 # for retention.
+#
+# Packs are only those that released ActPlane 0.1.8 can actually install and
+# fire (exec-based). The `information-flow` pack (file sinks, secret labels)
+# is not included: adding it would make every strict run fail closed until the
+# engine enables those rule classes on the attach path.
 version: 1
 profile: strict
 
@@ -11,7 +16,6 @@ policy:
   packs:
     - coding-agent-baseline
     - no-vcs-write
-    - no-secret-egress
   feedback: true
 
 evidence:

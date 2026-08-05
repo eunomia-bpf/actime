@@ -17,7 +17,7 @@ pub struct Pack {
 pub const PACKS: &[Pack] = &[
     Pack {
         name: "coding-agent-baseline",
-        summary: "System fence, evidence integrity, credential reporting, destructive VCS and mass deletion",
+        summary: "Destructive VCS and mass deletion (exec rules that install on ActPlane 0.1.8)",
         source: include_str!("../../../policies/coding-agent-baseline.dsl"),
     },
     Pack {
@@ -26,9 +26,9 @@ pub const PACKS: &[Pack] = &[
         source: include_str!("../../../policies/no-vcs-write.dsl"),
     },
     Pack {
-        name: "no-secret-egress",
-        summary: "Data derived from secret files may not reach the network, however it is copied",
-        source: include_str!("../../../policies/no-secret-egress.dsl"),
+        name: "information-flow",
+        summary: "File fences, credential reporting, secret-egress labels (needs engine file-sink features)",
+        source: include_str!("../../../policies/information-flow.dsl"),
     },
 ];
 

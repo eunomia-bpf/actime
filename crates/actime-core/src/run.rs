@@ -26,6 +26,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::enforceability::RuleEnforceability;
 
 // ---------------------------------------------------------------------------
 // RunId
@@ -268,6 +269,12 @@ pub struct Manifest {
     pub exit_code: Option<i32>,
     /// Akeep commit hash, if history ran.
     pub akeep_commit: Option<String>,
+    /// Rules from the composed policy that this host's engine cannot enforce.
+    ///
+    /// Recorded so observe runs and reports stay honest when a pack needs
+    /// ActPlane features the released engine does not enable on attach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unenforceable_rules: Vec<RuleEnforceability>,
 }
 
 impl Manifest {
@@ -288,6 +295,7 @@ impl Manifest {
             summary: RunSummary::default(),
             exit_code: None,
             akeep_commit: None,
+            unenforceable_rules: Vec::new(),
         }
     }
 }

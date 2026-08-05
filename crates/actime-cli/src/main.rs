@@ -2,7 +2,7 @@
 //!
 //! Actime is the effect plane for AI coding agents: policy, evidence, and
 //! history attached to an agent wherever it already runs. Bring your own
-//! sandbox. See `docs/DESIGN.md`.
+//! execution environment. See `docs/DESIGN.md`.
 
 mod commands;
 mod embedded;
@@ -22,7 +22,7 @@ pub const EXIT_VIOLATION: i32 = 3;
 #[command(
     name = "actime",
     version,
-    about = "Effect plane for AI coding agents: kernel policy, system evidence, and session history. Bring your own sandbox.",
+    about = "Effect plane for AI coding agents: kernel policy, system evidence, and session history. Bring your own execution environment.",
     long_about = None,
     after_help = "EXAMPLES:\n  \
       # check what your machine supports\n  \

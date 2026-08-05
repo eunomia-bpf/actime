@@ -201,6 +201,13 @@ impl PolicyPlane {
 
         // Wrap path (DESIGN.md): prepare only; the agent is launched under
         // `actplane run -- <cmd>` so enforcement is launch-time, not post-hoc.
+        //
+        // Outcome is provisional Active: the policy is not verifiably installed
+        // until `actplane run` succeeds. Callers must run
+        // [`PolicyPlane::confirm_install_from_log`] after the wrap exits and
+        // reclassify (and fail closed in enforce) when the engine log shows an
+        // install failure. Never leave a post-run report as Active if install
+        // failed — that is the same class of dishonesty as a false evidence plane.
         if spec.wrap_command {
             let version = spec.version.unwrap_or("unknown");
             plane.outcome = Outcome::Active(format!(
@@ -292,6 +299,8 @@ impl PolicyPlane {
     /// Build argv that launches `agent` under `actplane run` (host wrap path).
     ///
     /// Prefixes `sudo -n -E` when not root and a password prompt is not safe.
+    /// Invokes `actplane --policy <file> run -- <cmd>` so the engine installs
+    /// the composed policy for that run (not a post-hoc attach delta alone).
     pub fn wrap_argv(actplane: &Path, policy_yaml: &Path, agent: &[String]) -> Vec<String> {
         let mut v = Vec::new();
         if !is_root() {
@@ -310,12 +319,58 @@ impl PolicyPlane {
         v
     }
 
+    /// After a wrap launch, re-read the engine log and demote Active → Disabled
+    /// when the policy was never installed.
+    ///
+    /// Returns `true` when the plane remains active (or was already non-active).
+    /// Returns `false` when an install failure was found and the outcome was
+    /// reclassified to Disabled. Callers in `enforce` mode must fail closed.
+    pub fn confirm_install_from_log(&mut self, log: &Path) -> bool {
+        if !self.outcome.is_active() {
+            return true;
+        }
+        if let Some(err) = engine_log_error(log) {
+            self.outcome = Outcome::Disabled(format!("actplane failed to load policy: {err}"));
+            return false;
+        }
+        true
+    }
+
     /// Stop the engine. Safe to call more than once. No-op for wrap mode.
     ///
     /// Uses a multi-second SIGTERM grace so ActPlane can flush events.jsonl.
     pub fn stop(&mut self) {
         stop_child(&mut self.child, Duration::from_secs(5));
     }
+}
+
+/// Assess per-rule enforceability for the composed DSL against this host.
+///
+/// Delegates to [`actime_core::enforceability`] using the released ActPlane
+/// 0.1.8 pinned feature budget. Prefer [`assess_policy_with_compile`] when
+/// `actplane compile --json` is available.
+pub fn classify_rules(
+    dsl: &str,
+    install_error: Option<&str>,
+) -> Vec<actime_core::RuleEnforceability> {
+    actime_core::assess_dsl(
+        dsl,
+        actime_core::engine_supported_features(None),
+        install_error,
+    )
+}
+
+/// Assess enforceability from an `actplane compile --json` report.
+pub fn assess_policy_with_compile(
+    compile_json: &serde_json::Value,
+    actplane_version: Option<&str>,
+    install_error: Option<&str>,
+) -> Vec<actime_core::RuleEnforceability> {
+    actime_core::assess_compile_json(
+        compile_json,
+        actime_core::engine_supported_features(actplane_version),
+        install_error,
+    )
 }
 
 /// Write the ActPlane project YAML and the pure DSL companion file.
@@ -936,6 +991,114 @@ mod tests {
         let err = engine_log_error(&log).expect("error");
         assert!(err.contains("install policy"));
         assert!(engine_log_error(dir.path().join("missing").as_path()).is_none());
+    }
+
+    #[test]
+    fn install_failure_log_never_yields_active() {
+        // Regression: an engine that logs an install failure must never leave
+        // the policy plane as Active — same honesty class as the evidence plane.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("policy-engine.log");
+        std::fs::write(
+            &log,
+            "Error: \"install policy in domain 969630630: runtime policy delta requires features not \
+             enabled when the eBPF engine was loaded: path contains matches, path suffix matches. \
+             needed=0x53, supported=0x3f0, missing=0x3\"\n",
+        )
+        .expect("write");
+
+        // Attach-style: settle sees Alive but log has Error → Disabled.
+        // We cannot spawn a real actplane here; exercise confirm_install_from_log
+        // on a provisional wrap Active outcome.
+        let mut plane = PolicyPlane {
+            child: None,
+            outcome: Outcome::Active("actplane 0.1.8 · no-secret-egress · enforce · wrap".into()),
+            policy_file: Some(dir.path().join("policy.yaml")),
+        };
+        assert!(plane.outcome.is_active());
+        let still_ok = plane.confirm_install_from_log(&log);
+        assert!(!still_ok, "install failure must reclassify");
+        assert!(
+            !plane.outcome.is_active(),
+            "must not be Active after install failure, got {:?}",
+            plane.outcome
+        );
+        assert!(
+            matches!(plane.outcome, Outcome::Disabled(_)),
+            "expected Disabled, got {:?}",
+            plane.outcome
+        );
+        assert!(
+            plane.outcome.detail().contains("install policy")
+                || plane.outcome.detail().contains("failed to load policy"),
+            "detail={}",
+            plane.outcome.detail()
+        );
+
+        // Clean log → Active preserved.
+        let clean = dir.path().join("clean.log");
+        std::fs::write(&clean, "ActPlane: running pid 1 under COMMAND label\n").expect("write");
+        let mut ok_plane = PolicyPlane {
+            child: None,
+            outcome: Outcome::Active("wrap".into()),
+            policy_file: None,
+        };
+        assert!(ok_plane.confirm_install_from_log(&clean));
+        assert!(ok_plane.outcome.is_active());
+    }
+
+    #[test]
+    fn classify_rules_marks_file_rules_unenforceable_and_install_error_all() {
+        let dsl = r#"
+source AGENT = exec "**/claude"
+rule destructive-vcs:
+  kill exec "git" "--force" if AGENT
+  because "no force"
+rule system-fence:
+  block write file "/etc/**" if AGENT
+  because "no system writes"
+"#;
+        let rows = classify_rules(dsl, Some("path contains matches missing"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !r.enforceable));
+        assert!(rows[0].reason.contains("path contains"));
+
+        let ok = classify_rules(dsl, None);
+        assert_eq!(ok.len(), 2);
+        assert!(
+            ok.iter()
+                .any(|r| r.name == "destructive-vcs" && r.enforceable),
+            "{ok:?}"
+        );
+        assert!(
+            ok.iter()
+                .any(|r| r.name == "system-fence" && !r.enforceable && r.reason.contains("write")),
+            "{ok:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_preflight_rejects_unenforceable_subset() {
+        // Mirror the run-path gate: if any rule is not enforceable, enforce
+        // must fail closed before the agent starts.
+        let dsl = r#"
+source AGENT = exec "**/claude"
+source SECRET = file "**/.env"
+rule no-secret-egress:
+  kill connect endpoint "*" if AGENT and SECRET
+  because "no egress"
+"#;
+        let rows = classify_rules(dsl, None);
+        let bad: Vec<_> = rows.iter().filter(|r| !r.enforceable).collect();
+        assert!(!bad.is_empty(), "expected unenforceable rules: {rows:?}");
+        // The fail-closed message names rules and reasons.
+        let msg = bad
+            .iter()
+            .map(|r| format!("• {} — {}", r.name, r.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(msg.contains("no-secret-egress"));
+        assert!(msg.contains("missing features") || msg.contains("path"));
     }
 
     #[test]

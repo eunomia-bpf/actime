@@ -374,7 +374,6 @@ policy:
   packs:
     - coding-agent-baseline
     - no-vcs-write
-    - no-secret-egress
   feedback: true
 evidence:
   enabled: true

@@ -316,22 +316,28 @@ pub fn policy_check(ctx: &Context) -> Result<i32> {
 
     let text = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-    let rules = parsed
-        .get("rules")
-        .and_then(|r| r.as_array())
-        .map(|a| a.len());
     let warnings = parsed
         .get("warnings")
         .and_then(|w| w.as_array())
         .cloned()
         .unwrap_or_default();
 
+    // Per-rule enforceability: compile --json (kernel_op, target_kind, patterns)
+    // combined with this host's engine feature budget (ActPlane 0.1.8 pin).
+    let rows =
+        planes::assess_policy_with_compile(&parsed, components.actplane.version.as_deref(), None);
+    // Fall back to DSL scan if the JSON had no rule list.
+    let rows = if rows.is_empty() {
+        planes::classify_rules(&dsl, None)
+    } else {
+        rows
+    };
+
+    let enforceable = rows.iter().filter(|r| r.enforceable).count();
+    let total = rows.len();
     println!(
-        "{} {} from {}",
+        "{} policy compiled from {} · {enforceable}/{total} rules enforceable on this host",
         ui::green("ok"),
-        rules
-            .map(|n| format!("{n} rules compiled"))
-            .unwrap_or_else(|| "policy compiled".into()),
         cfg.policy.packs.join(", ")
     );
 
@@ -343,8 +349,40 @@ pub fn policy_check(ctx: &Context) -> Result<i32> {
         println!("{}", ui::warn(msg));
     }
 
+    if !rows.is_empty() {
+        println!();
+        println!(
+            "{:<24} {:<8} {:<12} REASON",
+            "RULE", "EFFECT", "ENFORCEABLE"
+        );
+        for r in &rows {
+            let mark = if r.enforceable {
+                ui::green("yes")
+            } else {
+                ui::yellow("no")
+            };
+            let reason = if r.enforceable {
+                String::new()
+            } else {
+                r.reason.clone()
+            };
+            println!("{:<24} {:<8} {:<12} {}", r.name, r.effect, mark, reason);
+        }
+        if rows.iter().any(|r| !r.enforceable) {
+            println!();
+            println!(
+                "{}",
+                ui::dim(
+                    "`--policy enforce` fails closed if any rule is not enforceable. \
+                     Drop those packs, or use `--policy observe`."
+                )
+            );
+        }
+    }
+
     // Warnings are informational: a policy that compiles with warnings still
-    // loads, and `check` is meant to be safe to gate CI on.
+    // loads, and `check` is meant to be safe to gate CI on. Unenforceable
+    // rules do not fail `check` — that is what `enforce` is for.
     Ok(0)
 }
 

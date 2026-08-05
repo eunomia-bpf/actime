@@ -150,6 +150,52 @@ pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
     let actplane_dir = run.dir.join("actplane");
     let _ = std::fs::create_dir_all(&actplane_dir);
 
+    let rule_rows = assess_composed_policy(
+        components.actplane.path.as_deref(),
+        components.actplane.version.as_deref(),
+        &dsl,
+    );
+    let unenforceable = actime_core::unenforceable_only(&rule_rows);
+    run.manifest.unenforceable_rules = unenforceable.clone();
+    let _ = run.save_manifest();
+
+    if cfg.policy.mode == PolicyMode::Enforce && !unenforceable.is_empty() {
+        run.manifest.planes.policy = PlaneState::Disabled(format!(
+            "{} rule(s) not enforceable on this host's ActPlane engine",
+            unenforceable.len()
+        ));
+        let _ = run.save_manifest();
+        let mut list = String::new();
+        for r in &unenforceable {
+            list.push_str(&format!("  • {} ({}) — {}\n", r.name, r.effect, r.reason));
+        }
+        bail!(
+            "policy.mode is `enforce` but these rules cannot be enforced on this host:\n\
+             \n\
+             {list}\n\
+             Actime fails closed rather than attaching with a silent subset.\n\
+             Options:\n\
+               • drop those packs from policy.packs\n\
+               • learn without blocking:  actime attach --policy observe --pid {}\n\
+               • inspect the gap:         actime policy check",
+            resolved.host_pid
+        );
+    }
+
+    if cfg.policy.mode == PolicyMode::Observe && !unenforceable.is_empty() && !ctx.quiet {
+        eprintln!(
+            "{}",
+            ui::warn(&format!(
+                "{} rule(s) are not enforceable — observe will not watch for them:",
+                unenforceable.len()
+            ))
+        );
+        for r in &unenforceable {
+            eprintln!("  • {} — {}", r.name, r.reason);
+        }
+        eprintln!();
+    }
+
     let mut policy = PolicyPlane::start(PolicyPlaneSpec {
         binary: components.actplane.path.as_deref(),
         version: components.actplane.version.as_deref(),
@@ -169,6 +215,16 @@ pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
     if cfg.policy.mode == PolicyMode::Enforce && !policy.outcome.is_active() {
         policy.stop();
         run.manifest.planes.policy = PlaneState::Disabled(policy.outcome.detail().to_string());
+        let rows = crate::planes::classify_rules(&dsl, Some(policy.outcome.detail()));
+        if !ctx.quiet && !rows.is_empty() {
+            eprintln!(
+                "{}",
+                ui::warn("policy install failed — no rules are enforceable:")
+            );
+            for r in &rows {
+                eprintln!("  • {} — {}", r.name, r.reason);
+            }
+        }
         bail!(
             "policy.mode is `enforce` but the policy plane could not start: {}\n\
              \n\
@@ -267,9 +323,64 @@ fn orchestrate_run(
     let actplane_dir = run.dir.join("actplane");
     let _ = std::fs::create_dir_all(&actplane_dir);
 
-    // Host launch always uses actplane wrap when policy is on: attach-after-spawn
-    // races short agents. Wrap is launch-time enforcement.
-    let wrap_policy = cfg.policy.mode != PolicyMode::Off;
+    // Per-rule enforceability before any engine start or agent launch.
+    // Never enforce a subset while presenting the whole policy as installed.
+    let rule_rows = assess_composed_policy(
+        components.actplane.path.as_deref(),
+        components.actplane.version.as_deref(),
+        &dsl,
+    );
+    let unenforceable = actime_core::unenforceable_only(&rule_rows);
+    run.manifest.unenforceable_rules = unenforceable.clone();
+    let _ = run.save_manifest();
+
+    if cfg.policy.mode == PolicyMode::Enforce && !unenforceable.is_empty() {
+        run.manifest.planes.policy = PlaneState::Disabled(format!(
+            "{} rule(s) not enforceable on this host's ActPlane engine",
+            unenforceable.len()
+        ));
+        let _ = run.save_manifest();
+        let mut list = String::new();
+        for r in &unenforceable {
+            list.push_str(&format!("  • {} ({}) — {}\n", r.name, r.effect, r.reason));
+        }
+        bail!(
+            "policy.mode is `enforce` but these rules cannot be enforced on this host:\n\
+             \n\
+             {list}\n\
+             Actime fails closed rather than running an agent with a silent subset.\n\
+             Options:\n\
+               • drop those packs from policy.packs (e.g. use coding-agent-baseline only)\n\
+               • learn without blocking:  actime run --policy observe -- <agent>\n\
+               • inspect the gap:         actime policy check\n\
+               • wait for ActPlane to enable the missing file-sink / path-matcher features"
+        );
+    }
+
+    if cfg.policy.mode == PolicyMode::Observe && !unenforceable.is_empty() && !ctx.quiet {
+        eprintln!(
+            "{}",
+            ui::warn(&format!(
+                "{} rule(s) are not enforceable on this host — observe will not watch for them:",
+                unenforceable.len()
+            ))
+        );
+        for r in &unenforceable {
+            eprintln!("  • {} — {}", r.name, r.reason);
+        }
+        eprintln!();
+    }
+
+    // Host launch uses actplane wrap when policy is on *and* every rule is
+    // enforceable. On released ActPlane 0.1.8 a single unenforceable clause
+    // fails the whole install; wrapping would abort the agent. Observe mode
+    // still runs the command as a plain child and records the gap.
+    let want_policy = cfg.policy.mode != PolicyMode::Off;
+    let wrap_policy = want_policy && unenforceable.is_empty();
+
+    // Prepare policy files whenever policy is requested (wrap_command writes
+    // them without starting an attach child). When rules are unenforceable we
+    // reclassify to Disabled and never launch the engine.
     let mut policy = PolicyPlane::start(PolicyPlaneSpec {
         binary: components.actplane.path.as_deref(),
         version: components.actplane.version.as_deref(),
@@ -281,10 +392,17 @@ fn orchestrate_run(
         feedback: actplane_dir.join("feedback.txt"),
         audit: actplane_dir.join("audit.jsonl"),
         host_pid: None,
-        wrap_command: wrap_policy,
+        wrap_command: want_policy, // prepare files; launch is separate
         feedback_enabled: cfg.policy.feedback,
         log: run.dir.join("policy-engine.log"),
     });
+    if want_policy && !unenforceable.is_empty() {
+        policy.outcome = Outcome::Disabled(format!(
+            "{} rule(s) not enforceable on this host's ActPlane engine; \
+             engine not started (see unenforceable_rules in the report)",
+            unenforceable.len()
+        ));
+    }
 
     if cfg.policy.mode == PolicyMode::Enforce && !policy.outcome.is_active() {
         policy.stop();
@@ -332,6 +450,7 @@ fn orchestrate_run(
     let _ = run.save_manifest();
     let started = Instant::now();
 
+    let policy_log = run.dir.join("policy-engine.log");
     let exit = if wrap_policy && policy.outcome.is_active() {
         let Some(bin) = components.actplane.path.as_deref() else {
             bail!("actplane disappeared after policy plane start");
@@ -340,7 +459,7 @@ fn orchestrate_run(
             bin,
             &run.policy_path(),
             &req.argv,
-            &run.dir.join("policy-engine.log"),
+            &policy_log,
             cfg.limits.wall_clock,
             ctx.quiet,
             |wrap_pid| {
@@ -362,6 +481,33 @@ fn orchestrate_run(
             },
         )?;
         run.manifest.target.host_pid = Some(wrap_pid);
+        // Wrap marked Active before launch. The engine log is the ground truth:
+        // if install failed, reclassify — never report Active when nothing was
+        // enforced. In enforce mode, fail closed rather than finish unprotected.
+        if !policy.confirm_install_from_log(&policy_log) {
+            run.manifest.planes.policy = PlaneState::Disabled(policy.outcome.detail().to_string());
+            let _ = run.save_manifest();
+            if cfg.policy.mode == PolicyMode::Enforce {
+                if let Some(mut ev) = evidence.take() {
+                    ev.stop();
+                }
+                policy.stop();
+                bail!(
+                    "policy.mode is `enforce` but the policy plane failed to install: {}\n\
+                     \n\
+                     Actime fails closed rather than running an agent unprotected.\n\
+                     Fix one of:\n\
+                       • re-run with privileges:  sudo actime run --policy enforce -- <agent>\n\
+                       • learn first without blocking:  actime run --policy observe -- <agent>\n\
+                       • diagnose this machine:  actime doctor\n\
+                       • check the engine log:  {}",
+                    policy.outcome.detail(),
+                    policy_log.display()
+                );
+            }
+        } else {
+            run.manifest.planes.policy = to_plane_state(&policy.outcome);
+        }
         code
     } else {
         // Plain child: no policy wrap.
@@ -1423,6 +1569,33 @@ fn compose(cfg: &Config, workspace: &str) -> Result<String> {
         extra.push((path.clone(), text));
     }
     embedded::compose_policy(&cfg.policy.packs, &extra, workspace)
+}
+
+/// Resolve per-rule enforceability for the composed DSL on this host.
+///
+/// Prefers `actplane compile --json` when the binary is available; falls back
+/// to DSL shape analysis against the known engine feature budget.
+fn assess_composed_policy(
+    actplane: Option<&Path>,
+    version: Option<&str>,
+    dsl: &str,
+) -> Vec<actime_core::RuleEnforceability> {
+    if let Some(binary) = actplane {
+        if let Ok(out) = Command::new(binary)
+            .args(["--rule", dsl, "compile", "--json"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    let rows = crate::planes::assess_policy_with_compile(&parsed, version, None);
+                    if !rows.is_empty() {
+                        return rows;
+                    }
+                }
+            }
+        }
+    }
+    crate::planes::classify_rules(dsl, None)
 }
 
 fn packs_label(cfg: &Config) -> String {
