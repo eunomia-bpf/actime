@@ -1,0 +1,126 @@
+name: Bug report
+description: Report something that is broken or behaves worse than docs/DESIGN.md promises.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Actime should never lose data
+        or crash without producing a run report, so those are especially
+        interesting to us. Fill in what you can; attach the run report if you
+        have one.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: run-id
+    attributes:
+      label: Run ID
+      description: The `actime` run id, e.g. `20260804-153012-a3f1`. Find it with `actime runs`.
+      placeholder: "20260804-153012-a3f1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Sandbox backend
+      description: What `actime` actually selected. Check `actime doctor`.
+      options:
+        - auto (resolved below)
+        - docker
+        - podman
+        - bwrap
+        - host (isolation plane off)
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`. The eBPF planes need >= 5.10.
+      placeholder: "6.8.0-xx-generic"
+    validations:
+      required: true
+
+  - type: input
+    id: actime-version
+    attributes:
+      label: Actime version
+      description: Output of `actime --version`.
+      placeholder: "actime 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / distro
+      placeholder: "Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`actime doctor --json` output"
+      description: |
+        Run `actime doctor --json` and paste the full output. This captures
+        which planes were detected, engine versions, and the resolved sandbox
+        backend. If `actime` will not start, paste any error verbatim.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: The exact commands you ran, including the agent command after `--`.
+      placeholder: |
+        actime run -- claude
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Run report (optional)
+      description: |
+        Attach the rendered report for the run: `actime report latest --markdown`,
+        or paste the contents of
+        `~/.local/share/actime/runs/<run-id>/report.md`.
+      render: markdown
+
+  - type: dropdown
+    id: consent
+    attributes:
+      label: May we follow up in this issue?
+      options:
+        - "yes"
+        - "no, keep it anonymous"
+    validations:
+      required: false

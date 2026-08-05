@@ -1,0 +1,30 @@
+# Rust build artifacts.
+# NOTE: Cargo.lock is COMMITTED for this binary workspace. Do not ignore it.
+/target
+**/*.rs.bk
+
+# Actime local state (runs, caches, per-project overrides).
+/.actime
+.actime/
+
+# SQLite stores produced by the evidence plane and tooling.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS / editor noise.
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+
+# ActPlane engine run artifacts (created when running actime from a checkout).
+/.actplane
+.actplane/
+
+# Local scratch homes used while testing actime itself.
+/.actime-test-home
+/TEST-REPORT.md

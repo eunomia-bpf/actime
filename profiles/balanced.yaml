@@ -1,0 +1,27 @@
+# Actime profile: balanced  (the default)
+#
+# Blocks destructive and exfiltration-shaped effects, allows ordinary
+# development. This is what `actime run -- claude` uses when you have no
+# actime.yaml.
+version: 1
+profile: balanced
+
+sandbox:
+  backend: auto
+  workdir: /workspace
+  network: allow
+
+policy:
+  mode: enforce
+  packs:
+    - coding-agent-baseline
+  feedback: true
+
+evidence:
+  enabled: true
+  capture: [process, file, network, ssl, resource]
+  redact: true
+
+history:
+  enabled: true
+  commit_on_exit: true

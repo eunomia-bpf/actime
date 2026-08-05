@@ -1,0 +1,28 @@
+# Actime profile: observe
+#
+# Nothing is ever blocked. Use this for the first week of a rollout: you learn
+# what your agents actually do before you decide what to forbid.
+#
+#   actime run --profile observe -- claude
+version: 1
+profile: observe
+
+sandbox:
+  backend: auto
+  workdir: /workspace
+  network: allow
+
+policy:
+  mode: observe
+  packs:
+    - coding-agent-baseline
+  feedback: false
+
+evidence:
+  enabled: true
+  capture: [process, file, network, ssl, resource]
+  redact: true
+
+history:
+  enabled: true
+  commit_on_exit: true

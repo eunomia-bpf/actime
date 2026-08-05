@@ -1,0 +1,62 @@
+name: Feature request
+description: Suggest a new capability or a change to Actime's behavior.
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Actime's scope is deliberately narrow (see docs/DESIGN.md §2 Non-goals):
+        it is a runtime that wraps an unmodified agent in isolation, policy,
+        evidence, and history planes. It is not an agent framework, model router,
+        or LLM proxy. Keep that in mind when framing the request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The change you'd like
+      description: |
+        Be concrete. If it touches configuration, name the field. If it touches
+        the CLI, name the command/flag. If it touches a plane, say which one
+        (isolation / policy / evidence / history).
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: plane
+    attributes:
+      label: Which plane does this affect?
+      options:
+        - isolation (sandbox backends)
+        - policy (ActPlane)
+        - evidence (AgentSight)
+        - history (Akeep)
+        - CLI / UX
+        - configuration / profiles
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: agent
+    attributes:
+      label: Which agent were you running when you hit this?
+      description: Optional. e.g. claude, codex, gemini, opencode, or a bare command.
+      placeholder: "claude"
+    validations:
+      required: false

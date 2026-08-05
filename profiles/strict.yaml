@@ -1,0 +1,44 @@
+# Actime profile: strict
+#
+# For CI runners, shared machines, and regulated repositories. The run fails
+# rather than degrade: a sandbox is required, and the policy plane must load.
+# Egress is allowlisted, and evidence is exported for retention.
+version: 1
+profile: strict
+
+sandbox:
+  backend: auto          # host is refused by the strict profile
+  workdir: /workspace
+  network: egress
+  allow_egress:
+    - api.anthropic.com
+    - api.openai.com
+    - generativelanguage.googleapis.com
+    - registry.npmjs.org
+    - pypi.org
+    - files.pythonhosted.org
+    - crates.io
+    - static.crates.io
+    - github.com
+    - codeload.github.com
+
+policy:
+  mode: enforce
+  packs:
+    - coding-agent-baseline
+    - no-vcs-write
+    - no-secret-egress
+  feedback: true
+
+evidence:
+  enabled: true
+  capture: [process, file, network, ssl, resource]
+  export: [otlp]
+  redact: true
+
+history:
+  enabled: true
+  commit_on_exit: true
+
+limits:
+  wall_clock: 4h
