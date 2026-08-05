@@ -150,6 +150,20 @@ history:
   commit_on_exit: false
 ```
 
+## Can Actime stop an agent from leaking my secrets?
+
+Not yet, and we would rather say that plainly than let you assume it. The
+`information-flow` pack expresses exactly this — data labeled from secret
+files (`.env`, `~/.ssh/id_*`, `~/.aws/credentials`, …) may not reach the
+network, with the label following the data across copies, pipes, and
+subprocesses — but enforcing it needs engine features (file-source label
+propagation, path matchers) that released ActPlane 0.1.8 does not provide on
+the attach path. The rule compiles; it does not install. `actime policy check`
+reports it as not enforceable, and `--policy enforce` refuses to start a run
+that requests it. What the policy plane enforces today is exec-level rules
+(`git --force`, `rm -rf`, `git push`), which hold below the tool layer. See
+[policies.md](./policies.md) for the full picture.
+
 ## Can I see what a policy will block before running?
 
 Yes. The policy subcommand inspects packs without running anything:
@@ -157,20 +171,29 @@ Yes. The policy subcommand inspects packs without running anything:
 ```sh
 actime policy list                 # packs shipped with actime
 actime policy show coding-agent-baseline
-actime policy check                # compile the configured policy; loads nothing
-actime policy explain              # what this kernel can enforce before the fact
+actime policy check                # per rule: enforceable on this host, or not, and why
+actime policy explain              # how each clause lowers to kernel matchers
 ```
 
-`check` and `explain` call the installed `actplane` binary and need no
-privileges, so `check` belongs in CI.
+`check` is the useful one before a run: it prints a table of every configured
+rule with an enforceable yes/no and the missing engine feature when the answer
+is no. It loads nothing into the kernel and needs no privileges, so it belongs
+in CI — run it before any `enforce` gate, because `enforce` fails closed
+(aborts the run) when a requested rule is not enforceable.
 
 ## Is it safe to run in CI?
 
 Yes. A common pattern is to gate a job on policy:
 
 ```sh
+actime policy check    # first: confirm every configured rule is enforceable here
 actime run --profile strict --fail-on-violation -- ./run-agent-task.sh
 ```
+
+Run `actime policy check` first because `enforce` fails closed — a requested
+rule the runner's engine cannot install aborts the run before the agent
+starts. `check` needs no privileges and prints the per-rule table, so a CI
+lint step can catch a policy that would never load.
 
 `--fail-on-violation` forces exit code `3` on any `kill` or `block` violation,
 so a CI step fails cleanly when the agent steps out of bounds. Otherwise the

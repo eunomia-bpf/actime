@@ -72,6 +72,28 @@ cargo install agentsight   # evidence plane (≥ 0.2.60; needs root or CAP_BPF)
 cargo install akeep        # history plane  (≥ 0.2.0; no privileges needed)
 ```
 
+`doctor` tells you which *planes* your machine supports. The companion
+question — which *policy rules* this host can actually enforce — is answered
+by `actime policy check`, which compiles the configured policy, loads nothing,
+and needs no privileges:
+
+```text
+$ actime policy check
+ok policy compiled from coding-agent-baseline · 2/2 rules enforceable on this host
+
+RULE                     EFFECT   ENFORCEABLE  REASON
+destructive-vcs          kill     yes
+mass-deletion            kill     yes
+```
+
+Enforceability is a host property, not a pack property. With released ActPlane
+0.1.8, exec-based rules install and fire; the file-sink and label-propagation
+rules in the shipped `information-flow` pack do not, and `check` says so one
+rule at a time with the missing engine feature named. Run it whenever you
+change `policy.packs`, and in CI before any `enforce` gate — a rule
+`enforce` cannot install aborts the run (fail closed), so this table is how
+you find out before the agent does.
+
 ## 3. A first run — no privileges, no engines
 
 The shortest path from nothing to a result:
@@ -133,12 +155,16 @@ actime run -- claude
 ```
 
 With no `actime.yaml`, Actime resolves the built-in `balanced` profile: policy
-`enforce` with the `coding-agent-baseline` pack, evidence on, history on. The
-policy and evidence planes need root or `CAP_BPF`. When you run unprivileged,
+`enforce` with the `coding-agent-baseline` pack, evidence on, history on. That
+pack is deliberately limited to exec-based rules (`destructive-vcs`,
+`mass-deletion`) that released ActPlane can actually install — run
+`actime policy check` to see the per-rule verdict for any pack you configure.
+The policy and evidence planes need root or `CAP_BPF`. When you run unprivileged,
 Actime invokes the engines through `sudo` (never prompting in non-interactive
 sessions); without privileges those two planes degrade and the reason is
-recorded in the manifest. In `enforce` mode a policy plane that cannot start
-aborts the run instead of running unprotected.
+recorded in the manifest. In `enforce` mode a policy plane that cannot start —
+or a requested rule that this host's engine cannot enforce — aborts the run
+instead of running unprotected.
 
 With the engines installed and sufficient privileges, the report looks like
 this (illustrative; values depend on the run):
@@ -286,6 +312,13 @@ Common reasons and fixes:
   `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`.
 - **policy disabled: `actplane 0.1.5 is below 0.1.8`** — the installed engine
   is too old. `cargo install actplane` and check `actime doctor` again.
+- **policy disabled: `N rule(s) not enforceable on this host's ActPlane
+  engine`** — the run was in `observe` mode and the configured packs contain
+  rules the installed engine cannot install (with released ActPlane 0.1.8:
+  every rule in the `information-flow` pack). The report lists them under
+  **Unenforceable rules** with the missing features; `actime policy check`
+  shows the same table before you run. In `enforce` mode this aborts the run
+  (exit 1) instead.
 - **evidence disabled: `agentsight is not installed`** — Actime still records
   argv, exit code, and duration (the process-level fallback), but not the full
   process/file/network trace. Fix: `cargo install agentsight`.

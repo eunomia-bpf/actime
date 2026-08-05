@@ -166,9 +166,11 @@ containment is simply not part of this position's job.
 
 **What breaks.** Nothing isolates the agent's resources or filesystem view —
 that is what a sandbox is for, and Actime does not provide one. The policy
-plane still stops the effects its rules cover (`git push --force`, `rm -rf`,
-secret egress), but an unconstrained agent otherwise shares your machine.
-Pair position C with the `coding-agent-baseline` pack at minimum.
+plane stops the exec-level effects its rules cover (`git push --force`,
+`rm -rf`); the labeled secret-egress rules in the `information-flow` pack are
+expressible but not enforceable with released ActPlane 0.1.8 — see
+[policies.md](./policies.md). An unconstrained agent otherwise shares your
+machine. Pair position C with the `coding-agent-baseline` pack at minimum.
 
 ## Choosing
 

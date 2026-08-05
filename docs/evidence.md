@@ -72,6 +72,14 @@ counters, and the violation table. The Markdown report (`--markdown`, and
 violations or events. The JSON report (`--json`) emits `{manifest, summary,
 violations, timeline}`.
 
+When a run was configured with policy rules this host's engine cannot enforce,
+the report also prints an **Unenforceable rules** section — rule, effect, and
+the missing engine feature for each — and the manifest carries the same list
+as `unenforceable_rules`. In `observe` mode the run proceeds with those rules
+unwatched and this section is how the record says so; in `enforce` mode the
+run aborts before the agent starts instead. `actime policy check` prints the
+same verdict before you run, without privileges.
+
 ## `violations.jsonl`
 
 One JSON object per line. The fields are exactly the `Violation` struct Actime
@@ -81,6 +89,13 @@ reads back:
 {"ts":"2026-08-04T15:33:02Z","rule":"destructive-vcs","effect":"kill","op":"exec","target":"/usr/bin/git","pid":41221,"comm":"git","reason":"Force-pushing, hard-resetting, and cleaning discard work that cannot be recovered..."}
 {"ts":"2026-08-04T15:33:41Z","rule":"no-secret-egress","effect":"kill","op":"connect","target":"203.0.113.9:443","pid":41307,"comm":"python3","reason":"This process holds data derived from a secret file and tried to open a network connection..."}
 ```
+
+The second line illustrates the format, not a violation you will see today:
+the `no-secret-egress` rule (pack `information-flow`) needs engine features
+released ActPlane 0.1.8 does not provide, so it cannot fire yet. Lines like
+the first — exec-level `kill` violations from `coding-agent-baseline` or
+`no-vcs-write` — are what the policy plane produces now. See
+[policies.md](./policies.md) for the enforceability status of each pack.
 
 `effect` is `notify`, `block`, or `kill`. In `observe` mode matches are
 recorded and nothing is stopped, which is how you see what `enforce` *would*

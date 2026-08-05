@@ -51,14 +51,25 @@ sandbox contains; Actime accounts.
 - **Three built-in profiles** ([DESIGN.md §9](./docs/DESIGN.md#9-profiles)):
   `observe` (nothing blocked), `balanced` (default; enforces the
   `coding-agent-baseline` pack), and `strict` (enforces
-  `coding-agent-baseline` + `no-vcs-write` + `no-secret-egress`, a 4h
-  wall-clock limit, and evidence configured for OTLP export).
+  `coding-agent-baseline` + `no-vcs-write` — the exec-based packs released
+  ActPlane can install — a 4h wall-clock limit, and evidence configured for
+  OTLP export).
 - **Three policy packs**, embedded in the binary: `coding-agent-baseline`
-  (destructive VCS and mass deletion — the rules that load and enforce on
-  ActPlane 0.1.8 today), `no-vcs-write` (the agent edits, the human
-  publishes), and `no-secret-egress` (data labeled from secret files may not
-  reach the network). `actime policy list / show / check / explain` inspect
-  and compile them without loading anything.
+  (destructive VCS and mass deletion — the exec-based rules that load and
+  enforce on ActPlane 0.1.8 today), `no-vcs-write` (the agent edits, the human
+  publishes), and `information-flow` (system fence, evidence integrity,
+  credential-access reporting, and the `no-secret-egress` rule — data labeled
+  from secret files may not reach the network). `actime policy list / show /
+  check / explain` inspect and compile them without loading anything.
+- **Rule enforceability as a host property.** Before any run, Actime resolves
+  which rules in the composed policy the installed ActPlane engine can
+  actually install, combining `actplane compile --json` output with the
+  engine's known feature budget. `actime policy check` prints the per-rule
+  table (rule, effect, enforceable yes/no, missing features) without loading
+  anything and without privileges. `--policy enforce` fails closed before the
+  agent starts if any requested rule is not enforceable; `--policy observe`
+  proceeds but records the unenforceable rules on the manifest
+  (`unenforceable_rules`) and prints them in the report.
 - **Configuration** via `actime.yaml` with a four-layer resolution order
   (`--config`, project file walking to the git root, `~/.config/actime/`, then
   the built-in `balanced` profile) and per-flag CLI overrides. Every field is
@@ -93,6 +104,25 @@ sandbox contains; Actime accounts.
 - **Community files:** `CONTRIBUTING.md`, `SECURITY.md` (report to
   security@eunomia.dev or a GitHub Security Advisory), `CODE_OF_CONDUCT.md`
   (Contributor Covenant 2.1), issue/PR templates, and this changelog.
+
+### Known limitations
+
+- **The `information-flow` pack is expressible but not enforceable with
+  released ActPlane 0.1.8.** On the attach / runtime-delta path Actime uses,
+  the engine's feature budget admits exec sink rules (and plain connect) but
+  not open/write sink rules or path contains/suffix matchers. Every rule in
+  `information-flow` — including `no-secret-egress`, the labeled secret-egress
+  rule — therefore compiles but does not install: `actime policy check`
+  reports all four rules as not enforceable, `--policy enforce` fails closed
+  if the pack is requested, and no default profile includes it. What the
+  policy plane enforces today is the exec-based rules in
+  `coding-agent-baseline` and `no-vcs-write`. The pack ships so the design is
+  inspectable and becomes enforceable unchanged when the engine enables those
+  rule classes.
+- The `evidence.capture` / `export` / `redact` fields are parsed and recorded
+  but not yet passed to AgentSight (the engine records its own defaults).
+- `policy.feedback: false` is recorded and shown as `feedback off` in the
+  report, but the generated `policy.yaml` still contains the feedback block.
 
 [Unreleased]: https://github.com/eunomia-bpf/actime/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/eunomia-bpf/actime/releases/tag/v0.1.0
