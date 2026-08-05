@@ -2,10 +2,10 @@
 
 This guide takes you from a fresh Linux machine to a real run report in about
 five minutes. Actime runs an **unmodified** coding agent and accounts for what
-it does across three planes: policy, evidence, history. It never creates
+it does across three planes: policy, observability, backup. It never creates
 containers or sandboxes — it attaches to the process tree you already have.
 The fastest proof needs no agent, no root, and no Docker:
-`actime run --policy off --no-history -- /bin/echo hi`.
+`actime run --policy off --no-backup -- /bin/echo hi`.
 
 > Contract reference: every field, flag, and behavior below is defined in
 > [docs/DESIGN.md](./DESIGN.md). This document only shows you how to use it.
@@ -42,7 +42,7 @@ ok    deployment                   running on a host (deployment A/C). Host-side
 ok    os                           Linux
 ok    kernel                       kernel 6.15.11-061511-generic (≥ 6.1)
 ok    btf                          /sys/kernel/btf/vmlinux present
-warn  cap_bpf                      neither root nor CAP_BPF; policy and evidence planes will disable
+warn  cap_bpf                      neither root nor CAP_BPF; policy and observability planes will disable
       → Run as root, or grant CAP_BPF (e.g. `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`), ...
 warn  actplane                     actplane 0.1.5 at ~/.local/bin/actplane is below minimum 0.1.8
       → cargo install actplane and ensure version ≥ 0.1.8
@@ -50,7 +50,7 @@ warn  agentsight                   agentsight 0.2.45 at ~/.local/bin/agentsight 
       → cargo install agentsight and ensure version ≥ 0.2.60
 ok    akeep                        akeep 0.2.0 at ~/.local/bin/akeep (≥ 0.2.0)
 ok    run_store                    writable at ~/.local/share/actime
-ok    config                       profile=balanced policy=enforce evidence=on history=on
+ok    config                       profile=balanced policy=enforce observability=on backup=on
 
 0 check(s) failed, 3 warning(s). Actime still runs: unavailable planes degrade rather than stopping a run.
 ```
@@ -63,13 +63,13 @@ host-side attach is available; inside a container it warns that this is
 deployment B and reports which capabilities are missing.
 
 The three engines are separate projects. They are what give you kernel-level
-policy enforcement and evidence; without them Actime still runs the agent,
+policy enforcement and observability; without them Actime still runs the agent,
 records the run, and writes a report.
 
 ```sh
 cargo install actplane     # policy plane  (≥ 0.1.8; needs root or CAP_BPF)
-cargo install agentsight   # evidence plane (≥ 0.2.60; needs root or CAP_BPF)
-cargo install akeep        # history plane  (≥ 0.2.0; no privileges needed)
+cargo install agentsight   # observability plane (≥ 0.2.60; needs root or CAP_BPF)
+cargo install akeep        # backup plane  (≥ 0.2.0; no privileges needed)
 ```
 
 `doctor` tells you which *planes* your machine supports. The companion
@@ -99,13 +99,13 @@ you find out before the agent does.
 The shortest path from nothing to a result:
 
 ```sh
-actime run --policy off --no-history -- /bin/echo hi
+actime run --policy off --no-backup -- /bin/echo hi
 ```
 
 Everything after `--` is the agent command. Real output:
 
 ```text
-actime  run 20260805-124610-f7db   target: command   policy: off   evidence: on
+actime  run 20260805-124610-f7db   target: command   policy: off   observability: on
 warning: policy plane disabled: policy.mode is off
 
 hi
@@ -129,8 +129,8 @@ Target
 Planes
 ------------------------------------------------------------------------
   policy     Disabled   policy.mode is off
-  evidence   Degraded   agentsight produced no process/file/network observatio…
-  history    Disabled   history.enabled is false
+  observability   Degraded   agentsight produced no process/file/network observatio…
+  backup    Disabled   backup.enabled is false
 
 Summary
 ------------------------------------------------------------------------
@@ -155,11 +155,11 @@ actime run -- claude
 ```
 
 With no `actime.yaml`, Actime resolves the built-in `balanced` profile: policy
-`enforce` with the `coding-agent-baseline` pack, evidence on, history on. That
+`enforce` with the `coding-agent-baseline` pack, observability on, backup on. That
 pack is deliberately limited to exec-based rules (`destructive-vcs`,
 `mass-deletion`) that released ActPlane can actually install — run
 `actime policy check` to see the per-rule verdict for any pack you configure.
-The policy and evidence planes need root or `CAP_BPF`. When you run unprivileged,
+The policy and observability planes need root or `CAP_BPF`. When you run unprivileged,
 Actime invokes the engines through `sudo` (never prompting in non-interactive
 sessions); without privileges those two planes degrade and the reason is
 recorded in the manifest. In `enforce` mode a policy plane that cannot start —
@@ -189,8 +189,8 @@ Target
 Planes
 ------------------------------------------------------------------------
   policy     Active
-  evidence   Active
-  history    Active
+  observability   Active
+  backup    Active
 
 Summary
 ------------------------------------------------------------------------
@@ -239,7 +239,7 @@ container's process tree is
 [deployment position A](./deployment.md), the strongest tamper story: root
 inside the container cannot disable the recorder or edit the record. Attach
 binds future events only (nothing is reconstructed), holds until the target
-exits or you press Ctrl-C, and does not commit history.
+exits or you press Ctrl-C, and does not commit a backup.
 
 ## 6. Read the record
 
@@ -262,7 +262,7 @@ The report is also written to disk as `report.md` in the run directory:
   policy.yaml            # the ActPlane project file the engine loaded (policy plane)
   policy.dsl             # the composed policy, human-readable   (policy plane)
   violations.jsonl       # harvested policy violations           (policy plane)
-  evidence.db            # AgentSight SQLite store               (evidence plane)
+  observability.db            # AgentSight SQLite store               (observability plane)
   *-engine.log           # engine stderr, when a plane was attempted
 ```
 
@@ -276,7 +276,7 @@ actime runs --json --limit 50    # machine-readable, capped
 actime status                    # runs still in progress
 ```
 
-Replay a run's agent session history with Akeep:
+Replay a run's agent session backup with Akeep:
 
 ```sh
 actime keep log                   # committed versions (delegates to `akeep log`)
@@ -284,7 +284,7 @@ actime keep restore 20260804-153012-a3f1          # into a scratch directory
 actime keep restore 20260804-153012-a3f1 --to ./restored
 ```
 
-`keep restore` works for runs whose history plane committed; the commit id is
+`keep restore` works for runs whose backup plane committed; the commit id is
 in the manifest as `akeep_commit`.
 
 ## 7. When a plane is degraded
@@ -319,13 +319,13 @@ Common reasons and fixes:
   **Unenforceable rules** with the missing features; `actime policy check`
   shows the same table before you run. In `enforce` mode this aborts the run
   (exit 1) instead.
-- **evidence disabled: `agentsight is not installed`** — Actime still records
+- **observability disabled: `agentsight is not installed`** — Actime still records
   argv, exit code, and duration (the process-level fallback), but not the full
   process/file/network trace. Fix: `cargo install agentsight`.
-- **history disabled: `attach does not commit history`** — expected for
+- **backup disabled: `attach does not commit a backup`** — expected for
   `actime attach`; there is no run exit to commit on.
-- **history degraded: `akeep commit failed: ...`** — the run finished but the
-  session history was not committed; the reason comes from `akeep` and the run
+- **backup degraded: `akeep commit failed: ...`** — the run finished but the
+  session backup was not committed; the reason comes from `akeep` and the run
   record is otherwise complete.
 
 If a run surprises you, the first thing to attach to a bug report is the doctor

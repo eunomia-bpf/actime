@@ -1,6 +1,6 @@
-//! Evidence aggregation: violations, AgentSight SQLite, and timeline.
+//! Observations aggregation: violations, AgentSight SQLite, and timeline.
 //!
-//! [`Evidence::collect`] is fail-soft: malformed JSONL lines are skipped, and
+//! [`Observations::collect`] is fail-soft: malformed JSONL lines are skipped, and
 //! an unknown or incomplete AgentSight schema degrades to zero counts rather
 //! than failing the whole collection.
 
@@ -48,28 +48,28 @@ pub struct TimelineEntry {
     pub summary: String,
 }
 
-/// Aggregated evidence for a run.
+/// Aggregated observations for a run.
 ///
-/// [`Default`] is the empty evidence set, which is what callers fall back to
-/// when a run directory has no violations file and no evidence database. That
+/// [`Default`] is the empty observations set, which is what callers fall back to
+/// when a run directory has no violations file and no observability database. That
 /// fallback is deliberate: a report is always produced, even for a run where
 /// every eBPF plane was disabled.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Evidence {
+pub struct Observations {
     /// Parsed policy violations (malformed lines skipped).
     pub violations: Vec<Violation>,
-    /// Summary counters (merged from violations + evidence.db + events).
+    /// Summary counters (merged from violations + observability.db + events).
     pub summary: RunSummary,
     /// Chronological timeline, capped at [`TIMELINE_CAP`].
     pub timeline: Vec<TimelineEntry>,
 }
 
-impl Evidence {
-    /// Collect evidence from a run directory.
+impl Observations {
+    /// Collect observations from a run directory.
     ///
-    /// Reads `violations.jsonl`, optionally `evidence.db` (schema-tolerant),
+    /// Reads `violations.jsonl`, optionally `observability.db` (schema-tolerant),
     /// and `events.jsonl`. Never fails solely because of schema mismatch.
-    pub fn collect(run: &Run) -> Result<Evidence> {
+    pub fn collect(run: &Run) -> Result<Observations> {
         let violations = read_violations(&run.violations_path())?;
         let mut summary = RunSummary::default();
 
@@ -89,8 +89,8 @@ impl Evidence {
         }
 
         // AgentSight SQLite — never fail on schema issues.
-        if run.evidence_db_path().is_file() {
-            if let Ok(db_counts) = collect_from_sqlite(&run.evidence_db_path()) {
+        if run.observability_db_path().is_file() {
+            if let Ok(db_counts) = collect_from_sqlite(&run.observability_db_path()) {
                 merge_db_counts(&mut summary, &db_counts);
             }
         }
@@ -130,7 +130,7 @@ impl Evidence {
             timeline.truncate(TIMELINE_CAP);
         }
 
-        Ok(Evidence {
+        Ok(Observations {
             violations,
             summary,
             timeline,
@@ -342,7 +342,7 @@ fn merge_db_counts(summary: &mut RunSummary, db: &DbCounts) {
     }
 }
 
-/// Open evidence.db read-only and aggregate known tables if present.
+/// Open observability.db read-only and aggregate known tables if present.
 ///
 /// On any error or schema mismatch, returns zero counts (caller treats as soft).
 fn collect_from_sqlite(path: &std::path::Path) -> Result<DbCounts> {
@@ -350,7 +350,8 @@ fn collect_from_sqlite(path: &std::path::Path) -> Result<DbCounts> {
     // agentsight run does not fail queries with "attempt to write a readonly
     // database" (SQLite otherwise tries to materialize a WAL index). Fall
     // back to plain mode=ro, then a normal open.
-    let conn = open_evidence_db(path).with_context(|| format!("opening {}", path.display()))?;
+    let conn =
+        open_observability_db(path).with_context(|| format!("opening {}", path.display()))?;
 
     let tables = list_tables(&conn).unwrap_or_default();
     let mut counts = DbCounts::default();
@@ -461,7 +462,7 @@ fn collect_from_sqlite(path: &std::path::Path) -> Result<DbCounts> {
 }
 
 /// Open an AgentSight SQLite store for read aggregation.
-fn open_evidence_db(path: &std::path::Path) -> Result<Connection> {
+fn open_observability_db(path: &std::path::Path) -> Result<Connection> {
     let path_s = path.display().to_string();
     // immutable=1: never attempt journal/WAL writes next to a root-owned file.
     let immutable = format!("file:{path_s}?immutable=1");
@@ -491,9 +492,9 @@ fn first_present<'a>(cols: &[String], candidates: &[&'a str]) -> Option<&'a str>
     None
 }
 
-/// True when the collected evidence contains any non-trivial observation.
+/// True when the collected observations contains any non-trivial observation.
 ///
-/// Used to stop the report from claiming the evidence plane is `Active` when
+/// Used to stop the report from claiming the observability plane is `Active` when
 /// the database is empty or unreadable.
 pub fn has_observational_signal(summary: &RunSummary) -> bool {
     summary.processes > 0
@@ -621,7 +622,7 @@ mod tests {
         writeln!(f, "{}", serde_json::to_string(&v2).unwrap()).unwrap();
         writeln!(f).unwrap();
 
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         assert_eq!(ev.violations.len(), 2);
         assert_eq!(ev.summary.violations, 2);
         assert_eq!(ev.summary.blocked, 1);
@@ -650,7 +651,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::open(tmp.path()).unwrap();
         let run = store.create(&["true".into()], &Config::default()).unwrap();
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         assert!(ev.violations.is_empty());
         assert_eq!(ev.summary.violations, 0);
         assert!(ev.timeline.is_empty());
@@ -664,7 +665,7 @@ mod tests {
 
         // Create a DB with unexpected tables/columns.
         {
-            let conn = Connection::open(run.evidence_db_path()).unwrap();
+            let conn = Connection::open(run.observability_db_path()).unwrap();
             conn.execute_batch(
                 "CREATE TABLE weird_stuff (id INTEGER);
                  INSERT INTO weird_stuff VALUES (1);
@@ -675,7 +676,7 @@ mod tests {
             .unwrap();
         }
 
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         // llm_calls exists → count rows, no token columns → zero tokens.
         assert_eq!(ev.summary.llm_calls, 2);
         assert_eq!(ev.summary.tokens_in, 0);
@@ -691,7 +692,7 @@ mod tests {
         let run = store.create(&["true".into()], &Config::default()).unwrap();
 
         {
-            let conn = Connection::open(run.evidence_db_path()).unwrap();
+            let conn = Connection::open(run.observability_db_path()).unwrap();
             conn.execute_batch(
                 "CREATE TABLE process_nodes (
                     id TEXT, pid INTEGER, comm TEXT, argv_json TEXT, view_source TEXT
@@ -716,7 +717,7 @@ mod tests {
             .unwrap();
         }
 
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         assert_eq!(ev.summary.processes, 2, "process_nodes rows");
         assert!(
             ev.summary.files_written >= 2,
@@ -744,7 +745,7 @@ mod tests {
         let run = store.create(&["true".into()], &Config::default()).unwrap();
 
         {
-            let conn = Connection::open(run.evidence_db_path()).unwrap();
+            let conn = Connection::open(run.observability_db_path()).unwrap();
             conn.execute_batch(
                 "CREATE TABLE llm_calls (
                     id INTEGER, tokens_in INTEGER, tokens_out INTEGER
@@ -764,7 +765,7 @@ mod tests {
             .unwrap();
         }
 
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         assert_eq!(ev.summary.llm_calls, 2);
         assert_eq!(ev.summary.tokens_in, 120);
         assert_eq!(ev.summary.tokens_out, 60);
@@ -794,7 +795,7 @@ mod tests {
         .unwrap();
         writeln!(f, "not-json").unwrap();
 
-        let ev = Evidence::collect(&run).unwrap();
+        let ev = Observations::collect(&run).unwrap();
         assert_eq!(ev.timeline.len(), 2);
         assert_eq!(ev.summary.processes, 1);
         assert_eq!(ev.summary.llm_calls, 1);

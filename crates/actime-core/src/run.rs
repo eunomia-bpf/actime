@@ -9,7 +9,7 @@
 //!   policy.yaml            ActPlane project file (engine loads this)
 //!   policy.dsl             composed pure DSL (human-readable)
 //!   violations.jsonl
-//!   evidence.db
+//!   observability.db
 //!   events.jsonl
 //!   stdout.log / stderr.log
 //!   report.md
@@ -150,18 +150,18 @@ impl PlaneState {
 pub struct PlaneStatus {
     /// Policy (ActPlane) plane.
     pub policy: PlaneState,
-    /// Evidence (AgentSight) plane.
-    pub evidence: PlaneState,
-    /// History (Akeep) plane.
-    pub history: PlaneState,
+    /// Observability (AgentSight) plane.
+    pub observability: PlaneState,
+    /// Backup (Akeep) plane.
+    pub backup: PlaneState,
 }
 
 impl Default for PlaneStatus {
     fn default() -> Self {
         Self {
             policy: PlaneState::Disabled("not started".into()),
-            evidence: PlaneState::Disabled("not started".into()),
-            history: PlaneState::Disabled("not started".into()),
+            observability: PlaneState::Disabled("not started".into()),
+            backup: PlaneState::Disabled("not started".into()),
         }
     }
 }
@@ -184,7 +184,7 @@ pub struct TargetReport {
     /// Host pid of the process tree root, when known.
     pub host_pid: Option<i32>,
     /// AgentSight `--binary-path` form when applicable (`docker://…`, `k8s://…`).
-    pub evidence_target: Option<String>,
+    pub observability_target: Option<String>,
     /// Optional human-readable note.
     pub note: Option<String>,
 }
@@ -195,7 +195,7 @@ impl Default for TargetReport {
             kind: "command".into(),
             spec: None,
             host_pid: None,
-            evidence_target: None,
+            observability_target: None,
             note: None,
         }
     }
@@ -267,7 +267,7 @@ pub struct Manifest {
     pub summary: RunSummary,
     /// Agent exit code, if finished.
     pub exit_code: Option<i32>,
-    /// Akeep commit hash, if history ran.
+    /// Akeep commit hash, if backup ran.
     pub akeep_commit: Option<String>,
     /// Rules from the composed policy that this host's engine cannot enforce.
     ///
@@ -363,9 +363,9 @@ impl Run {
         self.dir.join("events.jsonl")
     }
 
-    /// Path to `evidence.db`.
-    pub fn evidence_db_path(&self) -> PathBuf {
-        self.dir.join("evidence.db")
+    /// Path to `observability.db`.
+    pub fn observability_db_path(&self) -> PathBuf {
+        self.dir.join("observability.db")
     }
 
     /// Path to `stdout.log`.
@@ -650,7 +650,7 @@ mod tests {
         // Path helpers.
         assert!(got.violations_path().ends_with("violations.jsonl"));
         assert!(got.events_path().ends_with("events.jsonl"));
-        assert!(got.evidence_db_path().ends_with("evidence.db"));
+        assert!(got.observability_db_path().ends_with("observability.db"));
         assert!(got.stdout_path().ends_with("stdout.log"));
         assert!(got.stderr_path().ends_with("stderr.log"));
         assert!(got.report_path().ends_with("report.md"));

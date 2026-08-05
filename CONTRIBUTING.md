@@ -1,7 +1,7 @@
 # Contributing to Actime
 
 Thanks for considering a contribution. Actime is the effect plane for AI coding
-agents: it attaches three planes (policy, evidence, history) to an agent
+agents: it attaches three planes (policy, observability, backup) to an agent
 wherever that agent already runs. Actime does not manage sandboxes. The
 contract for all of it is [docs/DESIGN.md](./docs/DESIGN.md). Read it before
 changing anything public.
@@ -49,7 +49,7 @@ cargo build --workspace
 cargo test --workspace
 
 cargo run -p actime -- doctor
-cargo run -p actime -- run --policy off --no-history -- /bin/echo hi   # smoke test, no root needed
+cargo run -p actime -- run --policy off --no-backup -- /bin/echo hi   # smoke test, no root needed
 ```
 
 The unprivileged smoke run must work on a laptop with no agent installed, no
@@ -90,7 +90,7 @@ guidance so they are not missed:
 ## Repository layout
 
 ```
-crates/actime-core/      config, components, run store, evidence, reports, doctor
+crates/actime-core/      config, components, run store, observations, reports, doctor
 crates/actime-cli/       the `actime` binary and run orchestration
 policies/                ActPlane DSL packs, embedded into the binary
 profiles/                observe / balanced / strict, embedded into the binary
@@ -128,7 +128,7 @@ to do instead, not just what went wrong.
 3. Make sure CI is green: fmt, clippy with `-D warnings`, build, test,
    shellcheck.
 4. Address review feedback in new commits; avoid force-pushing during review
-   unless asked. We squash on merge, so your commit history is yours.
+   unless asked. We squash on merge, so your commit a backup is yours.
 
 We do not require a CONTRIBUTING CLA. Contributions fall under the project's MIT
 license.

@@ -29,8 +29,8 @@ Actime's core threat model is that the agent it runs may be adversarial or
 compromised. The guarantees we care about most are:
 
 - **The record cannot be tampered with from inside the sandbox.** The policy and
-  evidence planes attach from the host kernel; anything that lets the agent
-  disable them, escape them, or edit the evidence/manifest from inside the
+  observability planes attach from the host kernel; anything that lets the agent
+  disable them, escape them, or edit the record/manifest from inside the
   sandbox is a serious issue.
 - **Policy enforcement cannot be bypassed.** In `enforce` mode, an action that
   should be `block`ed or `kill`ed but is not, is a serious issue.

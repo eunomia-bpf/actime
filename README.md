@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/eunomia-bpf/actime/actions/workflows/ci.yml/badge.svg)](https://github.com/eunomia-bpf/actime/actions/workflows/ci.yml)
 
-**The effect plane for AI coding agents: kernel-enforced policy, system evidence, and session history, attached to the agent you already run, wherever it already runs.**
+**The effect plane for AI coding agents: kernel-enforced policy, system observability, and session backup, attached to the agent you already run, wherever it already runs.**
 
 ```console
 $ actime run -- claude
@@ -20,8 +20,8 @@ Actime attaches three planes to the agent's process tree, unmodified:
 | Plane | Component | Question it answers |
 |-------|-----------|---------------------|
 | Policy | [ActPlane](https://github.com/eunomia-bpf/ActPlane) (eBPF) | What is the agent allowed to do? |
-| Evidence | [AgentSight](https://github.com/eunomia-bpf/agentsight) (eBPF) | What did the agent actually do? |
-| History | [Akeep](https://github.com/eunomia-bpf/akeep) | What did the agent decide, and can we replay it? |
+| Observability | [AgentSight](https://github.com/eunomia-bpf/agentsight) (eBPF) | What did the agent actually do? |
+| Backup | [Akeep](https://github.com/eunomia-bpf/akeep) | What did the agent decide, and can we replay it? |
 
 What you get back is not a log the agent wrote. It is what the kernel saw.
 
@@ -50,7 +50,7 @@ actime doctor
 actime policy check
 
 # 4. A first run — works unprivileged, with no engines installed
-actime run --policy off --no-history -- /bin/echo hi
+actime run --policy off --no-backup -- /bin/echo hi
 
 # 5. Read the record
 actime report
@@ -69,7 +69,7 @@ mass-deletion            kill     yes
 ```
 
 That first run uses no eBPF and no privileges; it still produces a manifest and
-a report, with the policy and evidence planes marked `Disabled` and the reason
+a report, with the policy and observability planes marked `Disabled` and the reason
 recorded. For the full three planes, install the engines Actime drives and run
 your real agent:
 
@@ -110,8 +110,8 @@ Target
 Planes
 ------------------------------------------------------------------------
   policy     Disabled   policy.mode is off
-  evidence   Degraded   agentsight produced no process/file/network observatio…
-  history    Disabled   history.enabled is false
+  observability   Degraded   agentsight produced no process/file/network observatio…
+  backup    Disabled   backup.enabled is false
 
 Summary
 ------------------------------------------------------------------------
@@ -144,8 +144,8 @@ Target
 Planes
 ------------------------------------------------------------------------
   policy     Active
-  evidence   Active
-  history    Active
+  observability   Active
+  backup    Active
 
 Summary
 ------------------------------------------------------------------------
@@ -169,7 +169,7 @@ Next steps
 
 The full record lives in `~/.local/share/actime/runs/<run-id>/`: the manifest,
 the effective config, the exact policy that was loaded, every violation as
-JSONL, the AgentSight evidence database, and a rendered `report.md`. Override
+JSONL, the AgentSight observability database, and a rendered `report.md`. Override
 the root with `ACTIME_HOME`. `actime report <id> --markdown` adds a timeline
 section; `--json` emits the whole record for tooling.
 
@@ -247,8 +247,8 @@ change. [docs/policies.md](docs/policies.md) has the full story.
                               │
         ┌─────────────────────▼─────────────────────┐
         │  policy plane      ActPlane   (eBPF)      │   ← constrains
-        │  evidence plane    AgentSight (eBPF)      │   ← accounts
-        │  history plane     Akeep                  │   ← preserves
+        │  observability plane    AgentSight (eBPF)      │   ← accounts
+        │  backup plane     Akeep                  │   ← preserves
         └─────────────────────┬─────────────────────┘
                               │
                        run record + report
@@ -264,8 +264,8 @@ into one runtime, one config file, and one report:
 | Plane | Project | What it contributes |
 |---|---|---|
 | Policy | [ActPlane](https://github.com/eunomia-bpf/ActPlane) | kernel enforcement of policy rules: exec-level rules today, labeled information flow as the engine enables it |
-| Evidence | [AgentSight](https://github.com/eunomia-bpf/agentsight) | process, file, network, TLS, and resource evidence |
-| History | [Akeep](https://github.com/eunomia-bpf/akeep) | versioned, restorable agent session history |
+| Observability | [AgentSight](https://github.com/eunomia-bpf/agentsight) | process, file, network, TLS, and resource observations |
+| Backup | [Akeep](https://github.com/eunomia-bpf/akeep) | versioned, restorable agent session history |
 
 The eBPF instrumentation underneath comes from
 [bpftime](https://github.com/eunomia-bpf/bpftime). Each project remains useful
@@ -303,7 +303,7 @@ ok policy compiled from information-flow · 0/4 rules enforceable on this host
 
 RULE                     EFFECT   ENFORCEABLE  REASON
 credential-access        notify   no           engine missing features required on attach/delta path: path contains matches, path suffix matches
-evidence-integrity       block    no           engine missing features required on attach/delta path: path contains matches, write sink rules
+run-record-integrity       block    no           engine missing features required on attach/delta path: path contains matches, write sink rules
 no-secret-egress         kill     no           engine missing features required on attach/delta path: path contains matches, path suffix matches
 system-fence             block    no           engine missing features required on attach/delta path: write sink rules
 ```
@@ -345,11 +345,11 @@ and stricter as the environment allows. Nothing below aborts an `observe` run:
 
 | Missing | What happens |
 |---|---|
-| root / `CAP_BPF` | policy and evidence planes disabled; history still runs; `doctor` explains |
+| root / `CAP_BPF` | policy and observability planes disabled; backup still runs; `doctor` explains |
 | running inside a container without `CAP_BPF` | same; doctor warns that this is deployment B without host-side tamper-resistance |
 | `actplane` | policy plane disabled in `observe` mode; a hard failure in `enforce` (fail closed) |
-| `agentsight` | evidence plane disabled; process-level fallback still records argv, exit, duration |
-| `akeep` | history plane disabled |
+| `agentsight` | observability plane disabled; process-level fallback still records argv, exit, duration |
+| `akeep` | backup plane disabled |
 | kernel < 5.10 | policy plane disabled, with your kernel version in the reason |
 | a rule needs engine features the host lacks | `enforce`: the run aborts before the agent starts; `observe`: the run proceeds with the rule recorded as unenforceable in the manifest and report |
 
@@ -359,11 +359,11 @@ turn on the rest.
 
 ## Requirements
 
-- Linux. The policy and evidence planes need kernel 5.10+ with BTF
+- Linux. The policy and observability planes need kernel 5.10+ with BTF
   (`/sys/kernel/btf/vmlinux`); 6.1+ is recommended for the full runtime. The
-  history plane has no kernel requirement.
+  backup plane has no kernel requirement.
 - Root, or `CAP_BPF`/`CAP_PERFMON` on the engine binaries, for the policy and
-  evidence planes only. Everything else runs unprivileged.
+  observability planes only. Everything else runs unprivileged.
 - A container runtime (Docker/Podman) or `kubectl` only if you want
   `actime attach --container` / `--pod` to resolve those targets. Actime itself
   never starts a container.
@@ -377,7 +377,7 @@ planes need a Linux host kernel.
 - [Deployment positions](docs/deployment.md): outside the sandbox, inside it, or no sandbox
 - [Configuration reference](docs/configuration.md): every field of `actime.yaml`
 - [Policies](docs/policies.md): writing and testing your own rules
-- [Evidence and reports](docs/evidence.md): the run record, JSON, export
+- [Observability and reports](docs/observability.md): the run record, JSON, export
 - [Design](docs/DESIGN.md): the architecture contract
 - [FAQ](docs/faq.md)
 

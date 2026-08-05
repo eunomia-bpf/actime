@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use actime_core::config::{CliOverrides, Config, PolicyMode};
-use actime_core::evidence::Evidence;
+use actime_core::observations::Observations;
 use actime_core::run::{PlaneState, Run, RunStore, TargetReport};
 use actime_core::{components::Components, report};
 
 use crate::commands::Context as Ctx;
 use crate::embedded;
 use crate::planes::{
-    EvidencePlane, EvidencePlaneSpec, HistoryPlane, Outcome, PolicyPlane, PolicyPlaneSpec,
+    BackupPlane, ObservabilityPlane, ObservabilityPlaneSpec, Outcome, PolicyPlane, PolicyPlaneSpec,
 };
 use crate::ui;
 
@@ -28,10 +28,10 @@ pub struct RunRequest {
     pub argv: Vec<String>,
     /// `--policy`.
     pub policy: Option<String>,
-    /// `--no-evidence`.
-    pub no_evidence: bool,
-    /// `--no-history`.
-    pub no_history: bool,
+    /// `--no-observability`.
+    pub no_observability: bool,
+    /// `--no-backup`.
+    pub no_backup: bool,
     /// `--fail-on-violation`.
     pub fail_on_violation: bool,
     /// `--timeout`.
@@ -66,8 +66,8 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
             None => None,
         },
         profile: None,
-        no_evidence: req.no_evidence.then_some(true),
-        no_history: req.no_history.then_some(true),
+        no_observability: req.no_observability.then_some(true),
+        no_backup: req.no_backup.then_some(true),
     });
     if let Some(t) = &req.timeout {
         cfg.limits.wall_clock = Some(
@@ -96,7 +96,7 @@ pub fn run(ctx: &Ctx, req: RunRequest) -> Result<i32> {
         kind: "command".into(),
         spec: Some(req.argv.join(" ")),
         host_pid: None,
-        evidence_target: None,
+        observability_target: None,
         note: Some("launched as a host child process".into()),
     };
 
@@ -141,7 +141,7 @@ pub fn attach(ctx: &Ctx, req: AttachRequest) -> Result<i32> {
         kind: resolved.kind.clone(),
         spec: Some(resolved.label.clone()),
         host_pid: Some(resolved.host_pid),
-        evidence_target: resolved.evidence_target.clone(),
+        observability_target: resolved.observability_target.clone(),
         note: Some("attached to an already-running process tree; Actime did not create it".into()),
     };
 
@@ -258,17 +258,17 @@ fn attach_inner(
     }
     run.manifest.planes.policy = to_plane_state(&policy.outcome);
 
-    let mut evidence = EvidencePlane::start(EvidencePlaneSpec {
+    let mut observability = ObservabilityPlane::start(ObservabilityPlaneSpec {
         binary: components.agentsight.path.as_deref(),
         version: components.agentsight.version.as_deref(),
-        enabled: cfg.evidence.enabled,
-        target: resolved.evidence_target.clone(),
+        enabled: cfg.observability.enabled,
+        target: resolved.observability_target.clone(),
         host_pid: Some(resolved.host_pid),
-        db: run.evidence_db_path(),
-        log: run.dir.join("evidence-engine.log"),
+        db: run.observability_db_path(),
+        log: run.dir.join("observability-engine.log"),
     });
-    run.manifest.planes.evidence = to_plane_state(&evidence.outcome);
-    run.manifest.planes.history = PlaneState::Disabled("attach does not commit history".into());
+    run.manifest.planes.observability = to_plane_state(&observability.outcome);
+    run.manifest.planes.backup = PlaneState::Disabled("attach does not commit a backup".into());
     let _ = run.save_manifest();
 
     if !ctx.quiet {
@@ -278,14 +278,17 @@ fn attach_inner(
                 run.id.as_str(),
                 &format!("{} {}", resolved.kind, resolved.label),
                 &cfg.policy.mode.to_string(),
-                if evidence.outcome.is_active() {
+                if observability.outcome.is_active() {
                     "on"
                 } else {
                     "off"
                 },
             )
         );
-        for (name, outcome) in [("policy", &policy.outcome), ("evidence", &evidence.outcome)] {
+        for (name, outcome) in [
+            ("policy", &policy.outcome),
+            ("observability", &observability.outcome),
+        ] {
             if !outcome.is_active() {
                 eprintln!(
                     "{}",
@@ -314,7 +317,7 @@ fn attach_inner(
 
     // Engines must exit fully before harvest so events flush to disk.
     policy.stop();
-    evidence.stop();
+    observability.stop();
     harvest_actplane_events(run);
 
     run.manifest.summary.duration_seconds = started.elapsed().as_secs_f64();
@@ -438,9 +441,9 @@ fn orchestrate_run(
     }
     run.manifest.planes.policy = to_plane_state(&policy.outcome);
 
-    // Evidence attaches after the child exists. For wrap, that is the wrap pid;
+    // Observations attaches after the child exists. For wrap, that is the wrap pid;
     // for plain spawn, the agent pid. Started once we know the pid.
-    let mut evidence: Option<EvidencePlane> = None;
+    let mut observability: Option<ObservabilityPlane> = None;
 
     if !ctx.quiet {
         eprintln!(
@@ -449,7 +452,11 @@ fn orchestrate_run(
                 run.id.as_str(),
                 "command",
                 &cfg.policy.mode.to_string(),
-                if cfg.evidence.enabled { "on" } else { "off" },
+                if cfg.observability.enabled {
+                    "on"
+                } else {
+                    "off"
+                },
             )
         );
         if !policy.outcome.is_active() {
@@ -481,20 +488,20 @@ fn orchestrate_run(
             cfg.limits.wall_clock,
             ctx.quiet,
             |wrap_pid| {
-                // Attach evidence to the wrap tree as soon as it exists.
-                if evidence.is_none() && cfg.evidence.enabled {
-                    let plane = EvidencePlane::start(EvidencePlaneSpec {
+                // Attach observability to the wrap tree as soon as it exists.
+                if observability.is_none() && cfg.observability.enabled {
+                    let plane = ObservabilityPlane::start(ObservabilityPlaneSpec {
                         binary: components.agentsight.path.as_deref(),
                         version: components.agentsight.version.as_deref(),
                         enabled: true,
                         target: None,
                         host_pid: Some(wrap_pid),
-                        db: run.evidence_db_path(),
-                        log: run.dir.join("evidence-engine.log"),
+                        db: run.observability_db_path(),
+                        log: run.dir.join("observability-engine.log"),
                     });
-                    run.manifest.planes.evidence = to_plane_state(&plane.outcome);
+                    run.manifest.planes.observability = to_plane_state(&plane.outcome);
                     run.manifest.target.host_pid = Some(wrap_pid);
-                    evidence = Some(plane);
+                    observability = Some(plane);
                 }
             },
         )?;
@@ -506,7 +513,7 @@ fn orchestrate_run(
             run.manifest.planes.policy = PlaneState::Disabled(policy.outcome.detail().to_string());
             let _ = run.save_manifest();
             if cfg.policy.mode == PolicyMode::Enforce {
-                if let Some(mut ev) = evidence.take() {
+                if let Some(mut ev) = observability.take() {
                     ev.stop();
                 }
                 policy.stop();
@@ -532,18 +539,18 @@ fn orchestrate_run(
         let (code, agent_pid) =
             run_plain_child(&req.argv, cfg.limits.wall_clock, ctx.quiet, |agent_pid| {
                 run.manifest.target.host_pid = Some(agent_pid);
-                if evidence.is_none() {
-                    let plane = EvidencePlane::start(EvidencePlaneSpec {
+                if observability.is_none() {
+                    let plane = ObservabilityPlane::start(ObservabilityPlaneSpec {
                         binary: components.agentsight.path.as_deref(),
                         version: components.agentsight.version.as_deref(),
-                        enabled: cfg.evidence.enabled,
+                        enabled: cfg.observability.enabled,
                         target: None,
                         host_pid: Some(agent_pid),
-                        db: run.evidence_db_path(),
-                        log: run.dir.join("evidence-engine.log"),
+                        db: run.observability_db_path(),
+                        log: run.dir.join("observability-engine.log"),
                     });
-                    run.manifest.planes.evidence = to_plane_state(&plane.outcome);
-                    evidence = Some(plane);
+                    run.manifest.planes.observability = to_plane_state(&plane.outcome);
+                    observability = Some(plane);
                 }
             })?;
         run.manifest.target.host_pid = Some(agent_pid);
@@ -554,18 +561,18 @@ fn orchestrate_run(
     // mode. For attach-style (not used in run wrap path), stop the attach child.
     let policy_was_active = policy.outcome.is_active();
     policy.stop();
-    if let Some(mut ev) = evidence.take() {
-        let evidence_was_active = ev.outcome.is_active();
+    if let Some(mut ev) = observability.take() {
+        let obs_was_active = ev.outcome.is_active();
         ev.stop();
         // Brief settle so agentsight can finish WAL after SIGTERM.
-        if evidence_was_active {
+        if obs_was_active {
             std::thread::sleep(Duration::from_millis(300));
         }
     } else {
-        run.manifest.planes.evidence = PlaneState::Disabled(if cfg.evidence.enabled {
-            "evidence plane was not started".into()
+        run.manifest.planes.observability = PlaneState::Disabled(if cfg.observability.enabled {
+            "observability plane was not started".into()
         } else {
-            "evidence.enabled is false".into()
+            "observability.enabled is false".into()
         });
     }
 
@@ -577,17 +584,17 @@ fn orchestrate_run(
     run.manifest.summary.duration_seconds = started.elapsed().as_secs_f64();
 
     let message = cfg
-        .history
+        .backup
         .message
         .clone()
         .unwrap_or_else(|| format!("actime run {}", run.id));
-    let (history, commit) = HistoryPlane::commit(
+    let (backup, commit) = BackupPlane::commit(
         components.akeep.path.as_deref(),
-        cfg.history.enabled && cfg.history.commit_on_exit,
+        cfg.backup.enabled && cfg.backup.commit_on_exit,
         &message,
-        &run.dir.join("history.log"),
+        &run.dir.join("backup.log"),
     );
-    run.manifest.planes.history = to_plane_state(&history);
+    run.manifest.planes.backup = to_plane_state(&backup);
     run.manifest.akeep_commit = commit;
 
     Ok(exit)
@@ -967,7 +974,7 @@ struct ResolvedTarget {
     kind: String,
     label: String,
     host_pid: i32,
-    evidence_target: Option<String>,
+    observability_target: Option<String>,
 }
 
 fn resolve_attach_target(req: &AttachRequest) -> Result<ResolvedTarget> {
@@ -979,7 +986,7 @@ fn resolve_attach_target(req: &AttachRequest) -> Result<ResolvedTarget> {
             kind: "pid".into(),
             label: pid.to_string(),
             host_pid: pid,
-            evidence_target: None,
+            observability_target: None,
         });
     }
     if let Some(comm) = &req.comm {
@@ -988,7 +995,7 @@ fn resolve_attach_target(req: &AttachRequest) -> Result<ResolvedTarget> {
             kind: "comm".into(),
             label: comm.clone(),
             host_pid: pid,
-            evidence_target: None,
+            observability_target: None,
         });
     }
     if let Some(container) = &req.container {
@@ -997,16 +1004,16 @@ fn resolve_attach_target(req: &AttachRequest) -> Result<ResolvedTarget> {
             kind: "container".into(),
             label: container.clone(),
             host_pid: pid,
-            evidence_target: Some(format!("docker://{container}")),
+            observability_target: Some(format!("docker://{container}")),
         });
     }
     if let Some(pod) = &req.pod {
-        let (pid, evidence) = resolve_pod_host_pid(pod)?;
+        let (pid, obs_target) = resolve_pod_host_pid(pod)?;
         return Ok(ResolvedTarget {
             kind: "pod".into(),
             label: pod.clone(),
             host_pid: pid,
-            evidence_target: Some(evidence),
+            observability_target: Some(obs_target),
         });
     }
     bail!("give one of --pid, --comm, --container, or --pod");
@@ -1056,7 +1063,7 @@ fn resolve_pod_host_pid(ns_pod: &str) -> Result<(i32, String)> {
         Some((ns, name)) if !ns.is_empty() && !name.is_empty() => (ns, name),
         _ => bail!("pod must be `namespace/name`, e.g. `default/agent-0`. Got `{ns_pod}`."),
     };
-    let evidence = format!("k8s://{ns}/{name}");
+    let obs_target = format!("k8s://{ns}/{name}");
 
     let out = Command::new("kubectl")
         .args(["get", "pod", "-n", ns, name, "-o", "json"])
@@ -1090,7 +1097,7 @@ fn resolve_pod_host_pid(ns_pod: &str) -> Result<(i32, String)> {
             .or_else(|| inspect_container_pid("podman", bare))
             .or_else(|| crictl_container_pid(bare))
         {
-            return Ok((pid, evidence));
+            return Ok((pid, obs_target));
         }
     }
 
@@ -1382,7 +1389,7 @@ fn parse_kill_banner(text: &str) -> Option<String> {
 }
 
 /// When ActPlane leaves events.jsonl empty, reconstruct the violation from the
-/// engine log (kill evidence) and the composed `policy.dsl` (rule + because).
+/// engine log (kill record) and the composed `policy.dsl` (rule + because).
 fn synthesize_violation_from_log_and_policy(run: &Run) -> Option<String> {
     let log_text = read_run_logs(run);
     if log_text.is_empty() {
@@ -1542,21 +1549,21 @@ fn finish(ctx: &Ctx, run: &mut Run, exit: i32, fail_on_violation: bool) -> Resul
     run.manifest.exit_code = Some(exit);
     run.manifest.ended_at = Some(now_rfc3339());
 
-    let ev = Evidence::collect(run).unwrap_or_default();
+    let ev = Observations::collect(run).unwrap_or_default();
     let duration = run.manifest.summary.duration_seconds;
     run.manifest.summary = ev.summary.clone();
     run.manifest.summary.duration_seconds = duration;
 
-    if matches!(run.manifest.planes.evidence, PlaneState::Active)
-        && !actime_core::evidence::has_observational_signal(&ev.summary)
+    if matches!(run.manifest.planes.observability, PlaneState::Active)
+        && !actime_core::observations::has_observational_signal(&ev.summary)
     {
-        let reason = if run.evidence_db_path().is_file() {
-            "agentsight produced no process/file/network observations (empty or unreadable evidence.db)"
+        let reason = if run.observability_db_path().is_file() {
+            "agentsight produced no process/file/network observations (empty or unreadable observability.db)"
                 .to_string()
         } else {
-            "agentsight reported active but left no evidence.db".to_string()
+            "agentsight reported active but left no observability.db".to_string()
         };
-        run.manifest.planes.evidence = PlaneState::Degraded(reason);
+        run.manifest.planes.observability = PlaneState::Degraded(reason);
     }
 
     run.save_manifest()?;
@@ -1603,8 +1610,8 @@ fn finalize_aborted(ctx: &Ctx, run: &mut Run, exit: i32, reason: &str) {
     let refused = "not started: run refused before agent launch";
     for plane in [
         &mut run.manifest.planes.policy,
-        &mut run.manifest.planes.evidence,
-        &mut run.manifest.planes.history,
+        &mut run.manifest.planes.observability,
+        &mut run.manifest.planes.backup,
     ] {
         if matches!(plane, PlaneState::Disabled(s) if s == "not started") {
             *plane = PlaneState::Disabled(refused.into());
@@ -1622,7 +1629,7 @@ fn finalize_aborted(ctx: &Ctx, run: &mut Run, exit: i32, reason: &str) {
 
     let _ = run.save_manifest();
 
-    let ev = Evidence::collect(run).unwrap_or_default();
+    let ev = Observations::collect(run).unwrap_or_default();
     let md = report::render_markdown(run, &ev);
     let _ = std::fs::write(run.report_path(), &md);
 

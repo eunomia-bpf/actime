@@ -1,4 +1,4 @@
-//! The policy, evidence, and history planes.
+//! The policy, observability, and backup planes.
 //!
 //! Each plane wraps one external engine as a child process and reports whether
 //! it came up. Nothing here returns `Err` for an environment problem: a missing
@@ -207,7 +207,7 @@ impl PolicyPlane {
         // [`PolicyPlane::confirm_install_from_log`] after the wrap exits and
         // reclassify (and fail closed in enforce) when the engine log shows an
         // install failure. Never leave a post-run report as Active if install
-        // failed — that is the same class of dishonesty as a false evidence plane.
+        // failed — that is the same class of dishonesty as a false observability plane.
         if spec.wrap_command {
             let version = spec.version.unwrap_or("unknown");
             plane.outcome = Outcome::Active(format!(
@@ -419,41 +419,41 @@ fn yaml_scalar(p: &Path) -> String {
     format!("{:?}", p.display().to_string())
 }
 
-/// The evidence plane: AgentSight, recording the agent process tree.
-pub struct EvidencePlane {
+/// The observability plane: AgentSight, recording the agent process tree.
+pub struct ObservabilityPlane {
     child: Option<Child>,
     /// How the plane came up.
     pub outcome: Outcome,
 }
 
-/// Everything the evidence plane needs to start.
-pub struct EvidencePlaneSpec<'a> {
+/// Everything the observability plane needs to start.
+pub struct ObservabilityPlaneSpec<'a> {
     /// Resolved path to the `agentsight` binary, when it was found.
     pub binary: Option<&'a Path>,
     /// Version string for the report.
     pub version: Option<&'a str>,
-    /// Whether the evidence plane is wanted at all.
+    /// Whether the observability plane is wanted at all.
     pub enabled: bool,
     /// AgentSight `--binary-path` form when applicable (`docker://…`, `k8s://…`).
     pub target: Option<String>,
     /// Host pid to attach to when there is no scheme target.
     pub host_pid: Option<i32>,
-    /// Where the SQLite evidence store is written.
+    /// Where the SQLite observability store is written.
     pub db: PathBuf,
     /// Engine stderr goes here.
     pub log: PathBuf,
 }
 
-impl EvidencePlane {
+impl ObservabilityPlane {
     /// Attach AgentSight to the process tree. Never fails for an environment reason.
-    pub fn start(spec: EvidencePlaneSpec<'_>) -> EvidencePlane {
-        let mut plane = EvidencePlane {
+    pub fn start(spec: ObservabilityPlaneSpec<'_>) -> ObservabilityPlane {
+        let mut plane = ObservabilityPlane {
             child: None,
             outcome: Outcome::Disabled(String::new()),
         };
 
         if !spec.enabled {
-            plane.outcome = Outcome::Disabled("evidence.enabled is false".into());
+            plane.outcome = Outcome::Disabled("observability.enabled is false".into());
             return plane;
         }
 
@@ -481,7 +481,7 @@ impl EvidencePlane {
             }
             (None, None) => {
                 plane.outcome = Outcome::Disabled(
-                    "no host pid or container target to attach evidence to".into(),
+                    "no host pid or container target to attach observability to".into(),
                 );
                 return plane;
             }
@@ -537,15 +537,15 @@ impl EvidencePlane {
     }
 }
 
-/// The history plane: Akeep, committing agent session history after the run.
-pub struct HistoryPlane;
+/// The backup plane: Akeep, committing an agent session backup after the run.
+pub struct BackupPlane;
 
-impl HistoryPlane {
-    /// Commit the agent's session history and return the commit id.
+impl BackupPlane {
+    /// Commit an agent session backup and return the commit id.
     ///
     /// Runs after the agent has exited, so this is a foreground call rather
     /// than a managed child. Bounded by [`AKEEP_TIMEOUT`]: a hung or locked
-    /// vault degrades the history plane and never blocks the run exit path.
+    /// vault degrades the backup plane and never blocks the run exit path.
     pub fn commit(
         binary: Option<&Path>,
         enabled: bool,
@@ -553,7 +553,7 @@ impl HistoryPlane {
         log: &Path,
     ) -> (Outcome, Option<String>) {
         if !enabled {
-            return (Outcome::Disabled("history.enabled is false".into()), None);
+            return (Outcome::Disabled("backup.enabled is false".into()), None);
         }
         let Some(binary) = binary else {
             return (
@@ -575,7 +575,7 @@ impl HistoryPlane {
             Timed::Timeout => {
                 return (
                     Outcome::Degraded(format!(
-                        "akeep init timed out after {}; history left uncommitted",
+                        "akeep init timed out after {}; backup left uncommitted",
                         format_secs(AKEEP_TIMEOUT)
                     )),
                     None,
@@ -623,7 +623,7 @@ impl HistoryPlane {
             }
             Timed::Timeout => (
                 Outcome::Degraded(format!(
-                    "akeep commit timed out after {}; history left uncommitted",
+                    "akeep commit timed out after {}; backup left uncommitted",
                     format_secs(AKEEP_TIMEOUT)
                 )),
                 None,
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn install_failure_log_never_yields_active() {
         // Regression: an engine that logs an install failure must never leave
-        // the policy plane as Active — same honesty class as the evidence plane.
+        // the policy plane as Active — same honesty class as the observability plane.
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("policy-engine.log");
         std::fs::write(
@@ -1102,41 +1102,41 @@ rule no-secret-egress:
     }
 
     #[test]
-    fn evidence_plane_reports_why_it_cannot_attach() {
+    fn observability_plane_reports_why_it_cannot_attach() {
         let dir = tempfile::tempdir().expect("tempdir");
         let binary = PathBuf::from("/nonexistent/agentsight");
-        let plane = EvidencePlane::start(EvidencePlaneSpec {
+        let plane = ObservabilityPlane::start(ObservabilityPlaneSpec {
             binary: Some(&binary),
             version: Some("0.2.66"),
             enabled: true,
             target: None,
             host_pid: None,
-            db: dir.path().join("evidence.db"),
-            log: dir.path().join("evidence.log"),
+            db: dir.path().join("observability.db"),
+            log: dir.path().join("observability.log"),
         });
         assert!(plane.outcome.detail().contains("no host pid"));
     }
 
     #[test]
-    fn evidence_plane_respects_the_enabled_flag() {
+    fn observability_plane_respects_the_enabled_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let plane = EvidencePlane::start(EvidencePlaneSpec {
+        let plane = ObservabilityPlane::start(ObservabilityPlaneSpec {
             binary: None,
             version: None,
             enabled: false,
             target: Some("docker://x".into()),
             host_pid: Some(1),
-            db: dir.path().join("evidence.db"),
-            log: dir.path().join("evidence.log"),
+            db: dir.path().join("observability.db"),
+            log: dir.path().join("observability.log"),
         });
-        assert!(plane.outcome.detail().contains("evidence.enabled"));
+        assert!(plane.outcome.detail().contains("observability.enabled"));
     }
 
     #[test]
-    fn history_plane_is_disabled_without_akeep() {
+    fn backup_plane_is_disabled_without_akeep() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (outcome, commit) =
-            HistoryPlane::commit(None, true, "actime run", &dir.path().join("h.log"));
+            BackupPlane::commit(None, true, "actime run", &dir.path().join("h.log"));
         assert!(outcome.detail().contains("cargo install akeep"));
         assert!(commit.is_none());
     }
@@ -1227,10 +1227,10 @@ rule no-secret-egress:
     }
 
     #[test]
-    fn history_commit_disabled_when_off() {
+    fn backup_commit_disabled_when_off() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (outcome, commit) = HistoryPlane::commit(None, false, "msg", &dir.path().join("h.log"));
-        assert!(outcome.detail().contains("history.enabled"));
+        let (outcome, commit) = BackupPlane::commit(None, false, "msg", &dir.path().join("h.log"));
+        assert!(outcome.detail().contains("backup.enabled"));
         assert!(commit.is_none());
     }
 

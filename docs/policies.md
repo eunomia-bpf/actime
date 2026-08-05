@@ -48,7 +48,7 @@ agent starts, with the rules and the missing features named:
 error: policy.mode is `enforce` but these rules cannot be enforced on this host:
 
   • credential-access (notify) — engine missing features required on attach/delta path: path contains matches, path suffix matches
-  • evidence-integrity (block) — engine missing features required on attach/delta path: path contains matches, write sink rules
+  • run-record-integrity (block) — engine missing features required on attach/delta path: path contains matches, write sink rules
   • no-secret-egress (kill) — engine missing features required on attach/delta path: path contains matches, path suffix matches
   • system-fence (block) — engine missing features required on attach/delta path: write sink rules
 
@@ -88,7 +88,7 @@ else. Two rules:
 
 An honest limitation, straight from the pack's own header: with ActPlane
 0.1.8, file open/write sink rules and some path-matcher classes do not load as
-runtime policy, so the file-path fences (system fence, evidence integrity,
+runtime policy, so the file-path fences (system fence, run-record integrity,
 credential reporting) live in the `information-flow` pack instead, and the
 workspace-scoped form of `rm -rf` waits for the same engine support. This pack
 keeps only the rules that load and enforce today — exec `kill` — so
@@ -136,7 +136,7 @@ ok policy compiled from information-flow · 0/4 rules enforceable on this host
 
 RULE                     EFFECT   ENFORCEABLE  REASON
 credential-access        notify   no           engine missing features required on attach/delta path: path contains matches, path suffix matches
-evidence-integrity       block    no           engine missing features required on attach/delta path: path contains matches, write sink rules
+run-record-integrity       block    no           engine missing features required on attach/delta path: path contains matches, write sink rules
 no-secret-egress         kill     no           engine missing features required on attach/delta path: path contains matches, path suffix matches
 system-fence             block    no           engine missing features required on attach/delta path: write sink rules
 ```
@@ -152,7 +152,7 @@ The four rules:
 | Rule | Effect | What it expresses |
 |---|---|---|
 | `system-fence` | block | the agent may not write or unlink under `/etc`, `/usr`, `/bin`, `/sbin`, `/boot` |
-| `evidence-integrity` | block | the agent may not rewrite Actime's own run records |
+| `run-record-integrity` | block | the agent may not rewrite Actime's own run records |
 | `credential-access` | notify | credential reads (`~/.ssh/id_*`, `~/.aws/credentials`, …) are reported, not blocked |
 | `no-secret-egress` | kill | data labeled from a secret file may not reach the network |
 

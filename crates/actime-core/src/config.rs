@@ -169,12 +169,12 @@ pub struct Config {
     /// Policy plane settings.
     #[serde(default)]
     pub policy: PolicyConfig,
-    /// Evidence plane settings.
+    /// Observability plane settings.
     #[serde(default)]
-    pub evidence: EvidenceConfig,
-    /// History plane settings.
+    pub observability: ObservabilityConfig,
+    /// Backup plane settings.
     #[serde(default)]
-    pub history: HistoryConfig,
+    pub backup: BackupConfig,
     /// Run limits.
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -194,8 +194,8 @@ impl Default for Config {
             version: 1,
             profile: "balanced".into(),
             policy: PolicyConfig::default(),
-            evidence: EvidenceConfig::default(),
-            history: HistoryConfig::default(),
+            observability: ObservabilityConfig::default(),
+            backup: BackupConfig::default(),
             limits: LimitsConfig::default(),
         })
     }
@@ -237,10 +237,10 @@ impl Default for PolicyConfig {
     }
 }
 
-/// Evidence plane settings.
+/// Observability plane settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EvidenceConfig {
-    /// Whether the evidence plane is enabled.
+pub struct ObservabilityConfig {
+    /// Whether the observability plane is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Capture categories: process, file, network, ssl, resource.
@@ -264,7 +264,7 @@ fn default_capture() -> Vec<String> {
     ]
 }
 
-impl Default for EvidenceConfig {
+impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -275,10 +275,10 @@ impl Default for EvidenceConfig {
     }
 }
 
-/// History plane (Akeep) settings.
+/// Backup plane (Akeep) settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HistoryConfig {
-    /// Whether the history plane is enabled.
+pub struct BackupConfig {
+    /// Whether the backup plane is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Commit on run exit.
@@ -289,7 +289,7 @@ pub struct HistoryConfig {
     pub message: Option<String>,
 }
 
-impl Default for HistoryConfig {
+impl Default for BackupConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -322,10 +322,10 @@ pub struct CliOverrides {
     pub policy_mode: Option<PolicyMode>,
     /// `--profile <name>`.
     pub profile: Option<String>,
-    /// `--no-evidence`.
-    pub no_evidence: Option<bool>,
-    /// `--no-history`.
-    pub no_history: Option<bool>,
+    /// `--no-observability`.
+    pub no_observability: Option<bool>,
+    /// `--no-backup`.
+    pub no_backup: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +340,11 @@ policy:
   packs:
     - coding-agent-baseline
   feedback: false
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   redact: true
-history:
+backup:
   enabled: true
   commit_on_exit: true
 "#;
@@ -357,11 +357,11 @@ policy:
   packs:
     - coding-agent-baseline
   feedback: true
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   redact: true
-history:
+backup:
   enabled: true
   commit_on_exit: true
 "#;
@@ -375,12 +375,12 @@ policy:
     - coding-agent-baseline
     - no-vcs-write
   feedback: true
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   export: [otlp]
   redact: true
-history:
+backup:
   enabled: true
   commit_on_exit: true
 limits:
@@ -467,11 +467,11 @@ impl Config {
         if let Some(ref profile) = overrides.profile {
             self.profile = profile.clone();
         }
-        if overrides.no_evidence == Some(true) {
-            self.evidence.enabled = false;
+        if overrides.no_observability == Some(true) {
+            self.observability.enabled = false;
         }
-        if overrides.no_history == Some(true) {
-            self.history.enabled = false;
+        if overrides.no_backup == Some(true) {
+            self.backup.enabled = false;
         }
     }
 
@@ -536,8 +536,8 @@ struct PartialConfig {
     version: Option<u32>,
     profile: Option<String>,
     policy: Option<PartialPolicy>,
-    evidence: Option<PartialEvidence>,
-    history: Option<PartialHistory>,
+    observability: Option<PartialObservability>,
+    backup: Option<PartialBackup>,
     limits: Option<PartialLimits>,
 }
 
@@ -550,7 +550,7 @@ struct PartialPolicy {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct PartialEvidence {
+struct PartialObservability {
     enabled: Option<bool>,
     capture: Option<Vec<String>>,
     export: Option<Vec<String>>,
@@ -558,7 +558,7 @@ struct PartialEvidence {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct PartialHistory {
+struct PartialBackup {
     enabled: Option<bool>,
     commit_on_exit: Option<bool>,
     message: Option<String>,
@@ -591,29 +591,29 @@ fn merge_partial(cfg: &mut Config, p: PartialConfig) {
             cfg.policy.feedback = v;
         }
     }
-    if let Some(ev) = p.evidence {
+    if let Some(ev) = p.observability {
         if let Some(v) = ev.enabled {
-            cfg.evidence.enabled = v;
+            cfg.observability.enabled = v;
         }
         if let Some(v) = ev.capture {
-            cfg.evidence.capture = v;
+            cfg.observability.capture = v;
         }
         if let Some(v) = ev.export {
-            cfg.evidence.export = v;
+            cfg.observability.export = v;
         }
         if let Some(v) = ev.redact {
-            cfg.evidence.redact = v;
+            cfg.observability.redact = v;
         }
     }
-    if let Some(h) = p.history {
+    if let Some(h) = p.backup {
         if let Some(v) = h.enabled {
-            cfg.history.enabled = v;
+            cfg.backup.enabled = v;
         }
         if let Some(v) = h.commit_on_exit {
-            cfg.history.commit_on_exit = v;
+            cfg.backup.commit_on_exit = v;
         }
         if h.message.is_some() {
-            cfg.history.message = h.message;
+            cfg.backup.message = h.message;
         }
     }
     if let Some(lim) = p.limits {
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(obs.profile, "observe");
         assert_eq!(obs.policy.mode, PolicyMode::Observe);
         assert!(!obs.policy.feedback);
-        assert!(obs.evidence.enabled);
+        assert!(obs.observability.enabled);
 
         let bal = Config::builtin_profile("balanced").unwrap();
         assert_eq!(bal.profile, "balanced");
@@ -677,7 +677,7 @@ mod tests {
             strict.limits.wall_clock,
             Some(Duration::from_secs(4 * 3600))
         );
-        assert!(strict.evidence.export.contains(&"otlp".to_string()));
+        assert!(strict.observability.export.contains(&"otlp".to_string()));
     }
 
     #[test]
@@ -698,14 +698,14 @@ mod tests {
         let ov = CliOverrides {
             policy_mode: Some(PolicyMode::Observe),
             profile: Some("custom".into()),
-            no_evidence: Some(true),
-            no_history: Some(true),
+            no_observability: Some(true),
+            no_backup: Some(true),
         };
         cfg.merge_cli(&ov);
         assert_eq!(cfg.policy.mode, PolicyMode::Observe);
         assert_eq!(cfg.profile, "custom");
-        assert!(!cfg.evidence.enabled);
-        assert!(!cfg.history.enabled);
+        assert!(!cfg.observability.enabled);
+        assert!(!cfg.backup.enabled);
     }
 
     #[test]
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(cfg.profile, "observe");
         assert_eq!(cfg.policy.mode, PolicyMode::Off);
         assert!(!cfg.policy.feedback);
-        assert!(cfg.evidence.enabled);
+        assert!(cfg.observability.enabled);
     }
 
     #[test]

@@ -311,7 +311,7 @@ fn parse_commands_section(help: &str) -> Vec<String> {
 fn write_config_with_packs(dir: &Path, packs: &[&str]) {
     let packs_yaml: String = packs.iter().map(|p| format!("    - {p}\n")).collect();
     let yaml = format!(
-        "version: 1\nprofile: balanced\npolicy:\n  mode: enforce\n  packs:\n{packs_yaml}  feedback: true\nevidence:\n  enabled: false\nhistory:\n  enabled: false\n"
+        "version: 1\nprofile: balanced\npolicy:\n  mode: enforce\n  packs:\n{packs_yaml}  feedback: true\nobservability:\n  enabled: false\nbackup:\n  enabled: false\n"
     );
     std::fs::write(dir.join("actime.yaml"), yaml).expect("write actime.yaml");
 }
@@ -587,7 +587,7 @@ fn run_echo_creates_manifest_and_report() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "hello",
@@ -630,9 +630,9 @@ fn run_echo_creates_manifest_and_report() {
     let planes = m["planes"].as_object().expect("planes must be an object");
     assert!(
         planes.contains_key("policy")
-            && planes.contains_key("evidence")
-            && planes.contains_key("history"),
-        "planes must have policy/evidence/history: {planes:?}"
+            && planes.contains_key("observability")
+            && planes.contains_key("backup"),
+        "planes must have policy/observability/backup: {planes:?}"
     );
     assert!(
         !planes.contains_key("isolation"),
@@ -650,7 +650,7 @@ fn run_false_exits_one() {
     let home = tempfile::tempdir().expect("tempdir");
     let out = Cmd::new(home.path())
         .timeout(Duration::from_secs(90))
-        .args(["run", "--policy", "off", "--no-history", "--", "/bin/false"])
+        .args(["run", "--policy", "off", "--no-backup", "--", "/bin/false"])
         .run();
     out.assert_code("run /bin/false", 1);
 }
@@ -665,7 +665,7 @@ fn run_timeout_kills_long_sleep() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--timeout",
             "3s",
             "--",
@@ -696,7 +696,7 @@ fn run_timeout_kills_long_sleep() {
 fn run_without_command_fails() {
     let home = tempfile::tempdir().expect("tempdir");
     let out = Cmd::new(home.path())
-        .args(["run", "--policy", "off", "--no-history", "--"])
+        .args(["run", "--policy", "off", "--no-backup", "--"])
         .run();
     out.assert_failed("run with no command after --");
     let msg = out.combined().to_ascii_lowercase();
@@ -721,7 +721,7 @@ fn run_enforce_information_flow_fails_closed() {
             "run",
             "--policy",
             "enforce",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "should-not-run",
@@ -747,7 +747,7 @@ fn run_enforce_information_flow_fails_closed() {
     // on the released engine budget (DSL classify or compile --json).
     let names_any = [
         "system-fence",
-        "evidence-integrity",
+        "run-record-integrity",
         "credential-access",
         "no-secret-egress",
     ];
@@ -846,7 +846,7 @@ fn run_observe_information_flow_mentions_unenforceable() {
             "run",
             "--policy",
             "observe",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "observe-ok",
@@ -870,7 +870,7 @@ fn run_observe_information_flow_mentions_unenforceable() {
         blob.contains("unenforceable")
             || blob.contains("not enforceable")
             || blob.contains("system-fence")
-            || blob.contains("evidence-integrity"),
+            || blob.contains("run-record-integrity"),
         "observe report/output must mention unenforceable rules:\n{combined}\n--- report.md ---\n{report_md}"
     );
 }
@@ -941,7 +941,7 @@ fn runs_lists_and_report_json_contains_manifest() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "listed",
