@@ -28,11 +28,5 @@ serde_yaml.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.0"
-predicates = "3.1"
+serde_json.workspace = true
 tempfile.workspace = true
-
-# The integration suite under tests/cli.rs is owned by a parallel change and
-# scaffolds helpers before every test uses them. Allow dead_code so
-# `clippy -D warnings --all-targets` stays green without rewriting that file.
-[lints.rust]
-dead_code = "allow"
