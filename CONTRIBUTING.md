@@ -20,7 +20,7 @@ it. A PR that changes behavior without updating the contract will be sent back.
 
 ## Get set up
 
-You need Rust (MSRV 1.82), and optionally the three engines for full
+You need Rust (MSRV 1.85), and optionally the three engines for full
 end-to-end runs:
 
 ```sh

@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **MSRV raised to 1.85.** Dependencies in the lockfile (notably `clap` 4.6)
+  require Cargo's stable `edition2024` support. CI's MSRV job builds
+  `--workspace --all-targets --locked` on 1.85 so the declared floor is real.
+
+### Fixed
+
+- **Fail-closed enforce leaves an unambiguous run record.** When
+  `--policy enforce` refuses to start because rules are unenforceable (or the
+  policy plane cannot load), Actime still writes a finished run: `ended_at`
+  set, `exit_code` 1, a target note that the agent was never launched, planes
+  that never started labeled as such, and `report.md` rendered. A refusal is
+  an auditable event, not a half-written crash-looking directory.
 
 ## [0.1.0] - 2026-08-04
 
