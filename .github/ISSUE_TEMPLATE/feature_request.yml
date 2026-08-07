@@ -7,9 +7,9 @@ body:
     attributes:
       value: |
         Actime's scope is deliberately narrow (see docs/DESIGN.md §2 Non-goals):
-        it is a runtime that wraps an unmodified agent in isolation, policy,
-        evidence, and history planes. It is not an agent framework, model router,
-        or LLM proxy. Keep that in mind when framing the request.
+        it attaches policy, observability, and backup planes to an unmodified
+        agent. It is not an agent framework, model router, or LLM proxy. Keep
+        that in mind when framing the request.
 
   - type: textarea
     id: problem
@@ -26,7 +26,7 @@ body:
       description: |
         Be concrete. If it touches configuration, name the field. If it touches
         the CLI, name the command/flag. If it touches a plane, say which one
-        (isolation / policy / evidence / history).
+        (policy / observability / backup).
     validations:
       required: true
 
@@ -42,10 +42,9 @@ body:
     attributes:
       label: Which plane does this affect?
       options:
-        - isolation (sandbox backends)
         - policy (ActPlane)
-        - evidence (AgentSight)
-        - history (Akeep)
+        - observability (AgentSight)
+        - backup (Akeep)
         - CLI / UX
         - configuration / profiles
         - other

@@ -9,7 +9,7 @@ use anyhow::{bail, Context as _, Result};
 use actime_core::components::Components;
 use actime_core::config::Config;
 use actime_core::doctor::{self, CheckStatus};
-use actime_core::evidence::Evidence;
+use actime_core::observations::Observations;
 use actime_core::report;
 use actime_core::run::RunStore;
 
@@ -146,7 +146,7 @@ pub fn report(_ctx: &Context, id: &str, json: bool, markdown: bool) -> Result<i3
             format!("no run `{id}`. Use `actime runs` to list them.")
         }
     })?;
-    let ev = Evidence::collect(&run).unwrap_or_default();
+    let ev = Observations::collect(&run).unwrap_or_default();
 
     if json {
         println!("{}", report::render_json(&run, &ev)?);
@@ -415,7 +415,7 @@ pub fn keep_commit(ctx: &Context, message: Option<String>) -> Result<i32> {
     let msg = message.unwrap_or_else(|| "actime keep commit".to_string());
     let log = std::env::temp_dir().join("actime-keep.log");
     let (outcome, commit) =
-        planes::HistoryPlane::commit(components.akeep.path.as_deref(), true, &msg, &log);
+        planes::BackupPlane::commit(components.akeep.path.as_deref(), true, &msg, &log);
 
     if outcome.is_active() {
         println!(
@@ -453,9 +453,9 @@ pub fn keep_restore(_ctx: &Context, id: &str, to: Option<PathBuf>) -> Result<i32
     let run = store.get(id)?;
     let Some(commit) = run.manifest.akeep_commit.clone() else {
         bail!(
-            "run {} has no session history commit. The history plane was {}.",
+            "run {} has no session backup commit. The backup plane was {}.",
             run.id,
-            run.manifest.planes.history
+            run.manifest.planes.backup
         );
     };
 
@@ -525,7 +525,7 @@ pub fn doctor(ctx: &Context, json: bool) -> Result<i32> {
         println!(
             "{}",
             ui::dim(
-                "Not running as root. The policy and evidence planes will ask for sudo \
+                "Not running as root. The policy and observability planes will ask for sudo \
                  when a run starts."
             )
         );

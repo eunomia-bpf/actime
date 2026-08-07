@@ -11,8 +11,8 @@ to an agent wherever that agent already runs:
 | Plane | Component | Question it answers |
 |-------|-----------|---------------------|
 | Policy | [ActPlane](https://github.com/eunomia-bpf/ActPlane) | What is the agent allowed to do? |
-| Evidence | [AgentSight](https://github.com/eunomia-bpf/agentsight) | What did the agent actually do? |
-| History | [Akeep](https://github.com/eunomia-bpf/akeep) | What did the agent decide, and can we replay it? |
+| Observability | [AgentSight](https://github.com/eunomia-bpf/agentsight) | What did the agent actually do? |
+| Backup | [Akeep](https://github.com/eunomia-bpf/akeep) | What did the agent decide, and can we replay it? |
 
 Actime does **not** manage sandboxes. Bring your own sandbox, or none at all.
 Actime attaches to the process tree either way.
@@ -36,7 +36,7 @@ architectural constraint. All three must work:
 | **B** | **Inside the sandbox** — Actime in the same container/VM as the agent | E2B, Daytona, AWS AgentCore, managed Kubernetes, someone else's microVM; also shipping Actime inside a vendor image | Weaker: root inside can interfere. Code and docs must say so honestly — never promise host-side tamper-resistance here |
 | **C** | **No sandbox at all** — a process on a machine | Common workstation case | Same as host-side attach to a plain process tree |
 
-For **B**, policy and evidence need `CAP_BPF` (and often `CAP_PERFMON` /
+For **B**, policy and observability need `CAP_BPF` (and often `CAP_PERFMON` /
 `CAP_SYS_ADMIN` depending on the kernel) granted to the container. `actime
 doctor` detects in-container deployment and reports this with an actionable fix.
 
@@ -53,7 +53,7 @@ doctor` detects in-container deployment and reports this with an actionable fix.
 
 ```
 crates/actime-core/      config, profiles, component resolution, run store,
-                         evidence aggregation, reports, doctor checks
+                         observations aggregation, reports, doctor checks
 crates/actime-cli/       the `actime` binary (clap surface, orchestration)
 profiles/                observe.yaml, balanced.yaml, strict.yaml
 policies/                ActPlane policy packs shipped with actime
@@ -86,13 +86,13 @@ policy:
   files: []                  # extra ActPlane policy files
   feedback: true             # inject corrective feedback the agent can read
 
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   export: []                 # otlp | sqlite | json (json always written)
   redact: true               # strip auth headers and secret-shaped values
 
-history:
+backup:
   enabled: true
   commit_on_exit: true
   message: null              # default: "actime run <id>"
@@ -120,8 +120,8 @@ pub struct Config {
     pub version: u32,
     pub profile: String,
     pub policy: PolicyConfig,
-    pub evidence: EvidenceConfig,
-    pub history: HistoryConfig,
+    pub observability: ObservabilityConfig,
+    pub backup: BackupConfig,
     pub limits: LimitsConfig,
 }
 impl Config {
@@ -170,15 +170,15 @@ pub struct TargetReport {
     pub kind: String,                 // "command" | "pid" | "comm" | "container" | "pod"
     pub spec: Option<String>,         // user-facing handle
     pub host_pid: Option<i32>,
-    pub evidence_target: Option<String>, // "docker://…" | "k8s://…" when applicable
+    pub observability_target: Option<String>, // "docker://…" | "k8s://…" when applicable
     pub note: Option<String>,
 }
 
 /// Exactly three planes. There is no isolation plane.
 pub struct PlaneStatus {
     pub policy: PlaneState,
-    pub evidence: PlaneState,
-    pub history: PlaneState,
+    pub observability: PlaneState,
+    pub backup: PlaneState,
 }
 pub enum PlaneState { Active, Degraded(String), Disabled(String) }
 pub struct RunSummary {
@@ -197,20 +197,20 @@ impl RunStore {
     pub fn prune(&self, keep: usize) -> Result<usize>;
 }
 
-// evidence.rs — read back what the engines wrote
-pub struct Evidence { pub violations: Vec<Violation>, pub summary: RunSummary, pub timeline: Vec<TimelineEntry> }
+// observations.rs — read back what the engines wrote
+pub struct Observations { pub violations: Vec<Violation>, pub summary: RunSummary, pub timeline: Vec<TimelineEntry> }
 pub struct Violation {
     pub ts: String, pub rule: String, pub effect: String,   // notify | block | kill
     pub op: String, pub target: String, pub pid: i32, pub comm: String, pub reason: String,
 }
-impl Evidence {
-    pub fn collect(run: &Run) -> Result<Evidence>;
+impl Observations {
+    pub fn collect(run: &Run) -> Result<Observations>;
 }
 
 // report.rs
-pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String;
-pub fn render_json(run: &Run, ev: &Evidence) -> Result<String>;
-pub fn render_markdown(run: &Run, ev: &Evidence) -> String;
+pub fn render_text(run: &Run, ev: &Observations, width: usize) -> String;
+pub fn render_json(run: &Run, ev: &Observations) -> Result<String>;
+pub fn render_markdown(run: &Run, ev: &Observations) -> String;
 
 // doctor.rs
 pub struct Check { pub name: String, pub status: CheckStatus, pub detail: String, pub fix: Option<String> }
@@ -227,8 +227,8 @@ pub fn run_checks(cfg: &Config) -> Vec<Check>;
   policy.yaml            ActPlane project file (YAML with `policy: |`); the engine loads this
   policy.dsl             composed pure ActPlane DSL (human-readable; not passed to --policy)
   violations.jsonl       harvested policy violations (Actime canonical path)
-  evidence.db            AgentSight SQLite store (when the evidence plane ran)
-  events.jsonl           normalized evidence events (always written)
+  observability.db            AgentSight SQLite store (when the observability plane ran)
+  events.jsonl           normalized observation events (always written)
   stdout.log / stderr.log
   report.md              rendered on exit
   actplane/              ActPlane-owned feedback tree (`actplane run` wrap)
@@ -269,8 +269,8 @@ planes attached to.
 | `command` | `actime run -- <cmd>`: plain host child (or under `actplane run` when policy is on) |
 | `pid` | `actime attach --pid N` |
 | `comm` | `actime attach --comm NAME` (newest matching `/proc/*/comm`) |
-| `container` | `actime attach --container REF` → `docker inspect` / `podman inspect` for host pid; evidence target `docker://REF` |
-| `pod` | `actime attach --pod NS/POD` → `kubectl get pod -o json` → containerID → docker/podman/crictl inspect; evidence target `k8s://NS/POD` |
+| `container` | `actime attach --container REF` → `docker inspect` / `podman inspect` for host pid; observability target `docker://REF` |
+| `pod` | `actime attach --pod NS/POD` → `kubectl get pod -o json` → containerID → docker/podman/crictl inspect; observability target `k8s://NS/POD` |
 
 Actime **never** creates, starts, stops, or removes a container or pod. If the
 target does not exist, print a clear error and stop.
@@ -291,8 +291,9 @@ No container is created, ever.
 4. **Rule enforceability (before any engine start):** resolve which rules in
    the composed policy this host's ActPlane engine can actually install. See
    §7.1. In `enforce` mode, if any requested rule is not enforceable, **fail
-   closed before launching the agent**. In `observe` mode, proceed but record
-   unenforceable rules in the manifest and report.
+   closed before launching the agent**, then **finalize the run record** as a
+   refusal (see below). In `observe` mode, proceed but record unenforceable
+   rules in the manifest and report.
 5. **Policy plane:** when mode is not `off`, prepare `policy.yaml` and later
    wrap the agent with `actplane --policy <file> run -- <argv>` (launch-time
    enforcement; the engine installs the composed policy for that run).
@@ -301,13 +302,13 @@ No container is created, ever.
    plane is reclassified to **Disabled** with the engine's reason. In
    `enforce` mode a failure to start *or* install aborts the run (fail closed)
    rather than reporting Active while nothing was constrained.
-6. **Evidence plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
+6. **Observability plane:** attach `agentsight record --pid <wrap-or-agent-pid>`
    once the child exists. Always fail-soft.
 7. Wait for the agent / wrap. Enforce `limits.wall_clock`. Prefer natural
    engine exit so events flush; then SIGTERM with a long grace; then SIGKILL.
 8. On exit: stop engines (bounded), **harvest violations only after engines
-   have exited**, collect `Evidence`, update the manifest, run `akeep commit`
-   when history is enabled, render `report.md`, print the summary.
+   have exited**, collect `Observations`, update the manifest, run `akeep commit`
+   when backup is enabled, render `report.md`, print the summary.
 
 ### 7.1 Rule enforceability (host property)
 
@@ -330,7 +331,14 @@ Before a run, Actime:
 **`--policy enforce`:** if any rule is not enforceable, abort before the agent
 starts, list the rules and missing engine features, and tell the operator to
 drop those packs or use `--policy observe`. Silent partial enforcement is the
-worst outcome.
+worst outcome. The run directory is still kept and **finalized as a refusal**:
+`ended_at` set, `exit_code` 1, `target.note` containing
+`refused before agent launch`, planes that never started labeled
+`not started: run refused before agent launch` (policy may already be
+`Disabled` with the unenforceable-count reason), `unenforceable_rules` on the
+manifest, and `report.md` rendered. A refusal is an auditable event; it must
+not look like a crash mid-flight (`exit_code` null / no `ended_at` /
+"in progress" in `actime status`).
 
 **`--policy observe`:** proceed; store unenforceable rules on the manifest and
 print them in the report so the operator knows the run did not watch for them.
@@ -355,26 +363,27 @@ load.
 
 | Missing | Effect |
 |---------|--------|
-| root / `CAP_BPF` | policy + evidence disabled; history still runs; `doctor` explains |
+| root / `CAP_BPF` | policy + observability disabled; backup still runs; `doctor` explains |
 | running inside a container without CAP_BPF | same; doctor warns that this is deployment B without host-side tamper-resistance |
 | `actplane` binary | policy plane disabled in `observe`; hard error in `enforce` |
-| `agentsight` binary | evidence plane disabled; process-level fallback still records argv, exit, duration |
-| `akeep` binary | history plane disabled |
+| `agentsight` binary | observability plane disabled; process-level fallback still records argv, exit, duration |
+| `akeep` binary | backup plane disabled |
 | kernel < 5.10 | policy plane disabled with the kernel version in the reason |
 
 `actime run` always produces a manifest and a report, even when only the
-process-level fallback ran. Nothing in the exit path may be conditional on a
-plane having worked.
+process-level fallback ran, and even when the run was refused before the
+agent started. Nothing in the exit path may be conditional on a plane having
+worked.
 
 ## 9. Profiles
 
-- **observe** — policy `observe`, evidence on, history on. Nothing is ever
+- **observe** — policy `observe`, observability on, backup on. Nothing is ever
   blocked. The onboarding default for a new team.
 - **balanced** (default) — policy `enforce` with the `coding-agent-baseline`
-  pack, evidence on, history on. Blocks destructive and exfiltration-shaped
+  pack, observability on, backup on. Blocks destructive and exfiltration-shaped
   effects, allows normal development.
 - **strict** — policy `enforce` with `coding-agent-baseline` + `no-vcs-write`
-  (exec-based packs that released ActPlane can install), evidence on with
+  (exec-based packs that released ActPlane can install), observability on with
   `otlp` export, optional wall-clock limit. Fail closed on the policy plane.
   The `information-flow` pack (file sinks, secret labels) is shipped but not
   part of any default profile until the engine enables those rule classes.
@@ -383,7 +392,7 @@ plane having worked.
 
 ```
 actime init [--force] [--print]
-actime run [--policy MODE] [--no-evidence] [--no-history]
+actime run [--policy MODE] [--no-observability] [--no-backup]
            [--fail-on-violation] [--timeout D] -- <cmd>...
 actime attach (--pid N | --comm NAME | --container REF | --pod NS/POD)
               [--policy MODE]
@@ -406,7 +415,8 @@ no `shell` command. Isolation is the user's responsibility.
   kernel — none of these may abort a run. They degrade a plane and record the
   reason in the manifest. The one exception is `policy.mode: enforce`.
 - **Every run produces a manifest and a report**, even when only the
-  process-level fallback ran.
+  process-level fallback ran, and even when `enforce` refused before the
+  agent started (finalized refusal record, not a half-written directory).
 - **Never create containers.** `attach --container` / `--pod` only resolve
   already-existing targets.
 - **Harvest after engine exit.** Violations already produced by the kernel must

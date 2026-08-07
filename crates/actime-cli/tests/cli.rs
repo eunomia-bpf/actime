@@ -311,7 +311,7 @@ fn parse_commands_section(help: &str) -> Vec<String> {
 fn write_config_with_packs(dir: &Path, packs: &[&str]) {
     let packs_yaml: String = packs.iter().map(|p| format!("    - {p}\n")).collect();
     let yaml = format!(
-        "version: 1\nprofile: balanced\npolicy:\n  mode: enforce\n  packs:\n{packs_yaml}  feedback: true\nevidence:\n  enabled: false\nhistory:\n  enabled: false\n"
+        "version: 1\nprofile: balanced\npolicy:\n  mode: enforce\n  packs:\n{packs_yaml}  feedback: true\nobservability:\n  enabled: false\nbackup:\n  enabled: false\n"
     );
     std::fs::write(dir.join("actime.yaml"), yaml).expect("write actime.yaml");
 }
@@ -587,7 +587,7 @@ fn run_echo_creates_manifest_and_report() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "hello",
@@ -630,9 +630,9 @@ fn run_echo_creates_manifest_and_report() {
     let planes = m["planes"].as_object().expect("planes must be an object");
     assert!(
         planes.contains_key("policy")
-            && planes.contains_key("evidence")
-            && planes.contains_key("history"),
-        "planes must have policy/evidence/history: {planes:?}"
+            && planes.contains_key("observability")
+            && planes.contains_key("backup"),
+        "planes must have policy/observability/backup: {planes:?}"
     );
     assert!(
         !planes.contains_key("isolation"),
@@ -650,7 +650,7 @@ fn run_false_exits_one() {
     let home = tempfile::tempdir().expect("tempdir");
     let out = Cmd::new(home.path())
         .timeout(Duration::from_secs(90))
-        .args(["run", "--policy", "off", "--no-history", "--", "/bin/false"])
+        .args(["run", "--policy", "off", "--no-backup", "--", "/bin/false"])
         .run();
     out.assert_code("run /bin/false", 1);
 }
@@ -665,7 +665,7 @@ fn run_timeout_kills_long_sleep() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--timeout",
             "3s",
             "--",
@@ -696,7 +696,7 @@ fn run_timeout_kills_long_sleep() {
 fn run_without_command_fails() {
     let home = tempfile::tempdir().expect("tempdir");
     let out = Cmd::new(home.path())
-        .args(["run", "--policy", "off", "--no-history", "--"])
+        .args(["run", "--policy", "off", "--no-backup", "--"])
         .run();
     out.assert_failed("run with no command after --");
     let msg = out.combined().to_ascii_lowercase();
@@ -709,10 +709,8 @@ fn run_without_command_fails() {
 
 #[test]
 fn run_enforce_information_flow_fails_closed() {
-    // BUG: fail-closed enforce still creates a run directory with exit_code
-    // null and planes mostly "not started" (agent never launched). That is
-    // intentional enough to leave alone here; the suite only requires exit 1
-    // and that the agent did not run.
+    // Fail-closed enforce must refuse the agent and leave an unambiguous
+    // finished run record (refusal is auditable, not a half-written crash).
     let home = tempfile::tempdir().expect("tempdir");
     write_config_with_packs(home.path(), &["information-flow"]);
 
@@ -723,7 +721,7 @@ fn run_enforce_information_flow_fails_closed() {
             "run",
             "--policy",
             "enforce",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "should-not-run",
@@ -749,7 +747,7 @@ fn run_enforce_information_flow_fails_closed() {
     // on the released engine budget (DSL classify or compile --json).
     let names_any = [
         "system-fence",
-        "evidence-integrity",
+        "run-record-integrity",
         "credential-access",
         "no-secret-egress",
     ];
@@ -777,6 +775,63 @@ fn run_enforce_information_flow_fails_closed() {
             "without actplane, still expect unenforceable-rule messaging:\n{msg}"
         );
     }
+
+    // Auditable refusal record: finished run, exit 1, refused note, report.md.
+    let dirs = list_run_dirs(home.path());
+    assert_eq!(
+        dirs.len(),
+        1,
+        "fail-closed enforce must leave exactly one run dir, got {dirs:?}"
+    );
+    let run_dir = &dirs[0];
+    assert!(
+        run_dir.join("manifest.json").is_file(),
+        "manifest.json missing after fail-closed refusal"
+    );
+    assert!(
+        run_dir.join("report.md").is_file(),
+        "report.md missing after fail-closed refusal"
+    );
+
+    let m = read_manifest(run_dir);
+    assert_eq!(
+        m["exit_code"], 1,
+        "refused run must have exit_code 1, got {}",
+        m["exit_code"]
+    );
+    assert!(
+        m["ended_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "refused run must set ended_at so it is not listed as live: {}",
+        m["ended_at"]
+    );
+    let note = m["target"]["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("refused before agent launch"),
+        "target.note must say the agent was never launched:\n{note}"
+    );
+    assert!(
+        m.get("unenforceable_rules")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        "manifest must list unenforceable_rules: {}",
+        m["unenforceable_rules"]
+    );
+
+    let report = std::fs::read_to_string(run_dir.join("report.md")).expect("report.md");
+    assert!(
+        report.to_ascii_lowercase().contains("refused") || report.contains("Unenforceable"),
+        "report.md must describe the refusal:\n{report}"
+    );
+
+    // Must not look like an in-progress run.
+    let status = Cmd::new(home.path()).arg("status").run();
+    status.assert_ok("status after fail-closed");
+    let status_text = status.combined().to_ascii_lowercase();
+    assert!(
+        status_text.contains("no runs in progress") || status_text.contains("no run"),
+        "refused run must not appear as in-progress:\n{}",
+        status.combined()
+    );
 }
 
 #[test]
@@ -791,7 +846,7 @@ fn run_observe_information_flow_mentions_unenforceable() {
             "run",
             "--policy",
             "observe",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "observe-ok",
@@ -815,7 +870,7 @@ fn run_observe_information_flow_mentions_unenforceable() {
         blob.contains("unenforceable")
             || blob.contains("not enforceable")
             || blob.contains("system-fence")
-            || blob.contains("evidence-integrity"),
+            || blob.contains("run-record-integrity"),
         "observe report/output must mention unenforceable rules:\n{combined}\n--- report.md ---\n{report_md}"
     );
 }
@@ -886,7 +941,7 @@ fn runs_lists_and_report_json_contains_manifest() {
             "run",
             "--policy",
             "off",
-            "--no-history",
+            "--no-backup",
             "--",
             "/bin/echo",
             "listed",

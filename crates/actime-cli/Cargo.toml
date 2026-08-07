@@ -1,6 +1,6 @@
 [package]
 name = "actime"
-description = "Effect plane for AI coding agents: kernel policy, system evidence, and session history — bring your own sandbox"
+description = "Effect plane for AI coding agents: kernel policy, system observability, and session backup — bring your own sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

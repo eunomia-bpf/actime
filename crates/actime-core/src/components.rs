@@ -46,9 +46,9 @@ impl Component {
 pub struct Components {
     /// ActPlane policy engine.
     pub actplane: Component,
-    /// AgentSight evidence engine.
+    /// AgentSight observability engine.
     pub agentsight: Component,
-    /// Akeep history engine.
+    /// Akeep backup engine.
     pub akeep: Component,
 }
 

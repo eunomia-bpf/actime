@@ -13,11 +13,11 @@ policy:
     - coding-agent-baseline
   feedback: false
 
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   redact: true
 
-history:
+backup:
   enabled: true
   commit_on_exit: true
