@@ -31,7 +31,7 @@ and reports which capabilities are missing, with the fix.
 
 The strongest position. The sandbox (a container or pod you or your platform
 created) contains the agent; Actime runs on the host, outside that boundary,
-and attaches the policy and evidence planes to the container's process tree
+and attaches the policy and observability planes to the container's process tree
 from outside.
 
 **Choose it when** you own the host: developer workstations, CI runners,
@@ -54,15 +54,15 @@ sudo actime attach --pod default/agent-0
 `--container` accepts a Docker or Podman name or id and resolves it with
 `docker inspect` / `podman inspect` to the container's host pid. `--pod` takes
 `namespace/name`, resolves it through `kubectl` to the container id, then to a
-host pid. In both cases the evidence plane is pointed at the container
+host pid. In both cases the observability plane is pointed at the container
 (`docker://…` / `k8s://…`), not just the pid, so AgentSight sees the container
 boundary. If the target does not exist, Actime prints a clear error and stops.
 
 Attach binds the planes to future events; it does not reconstruct anything the
 agent did before you attached. Actime holds until the target exits or you
-detach with Ctrl-C, then writes the manifest and report as usual. The history
+detach with Ctrl-C, then writes the manifest and report as usual. The backup
 plane does not run under `attach` (there is no run exit to commit on), so the
-report shows it `Disabled` with the reason `attach does not commit history`.
+report shows it `Disabled` with the reason `attach does not commit a backup`.
 
 **Tamper story.** The recorder and the record live on the host. An agent that
 gets root *inside* its container cannot kill the recorder, unload the eBPF
@@ -70,7 +70,7 @@ programs, or edit the run directory — those are all on the other side of the
 container boundary, in a mount namespace the container cannot see.
 
 **Needs.** Root or `CAP_BPF` (often plus `CAP_PERFMON`) on the host, for the
-policy and evidence planes. Docker/Podman/`kubectl` present for target
+policy and observability planes. Docker/Podman/`kubectl` present for target
 resolution.
 
 **What breaks.** You cannot use this position when you do not own the host —
@@ -128,18 +128,18 @@ or message should claim otherwise. If you need the strong guarantee, you need
 position A, which means owning the host.
 
 What you still get in position B, even against an agent without root:
-kernel-enforced policy on every effect, the full evidence record, and session
-history — enforced below the tool layer, which a non-root agent cannot route
+kernel-enforced policy on every effect, the full observability record, and session
+backup — enforced below the tool layer, which a non-root agent cannot route
 around.
 
 **Needs.** `CAP_BPF` (often plus `CAP_PERFMON`, or `CAP_SYS_ADMIN` on older
 kernels) granted to the container, and a kernel with BTF
 (`/sys/kernel/btf/vmlinux`). If the platform will not grant the capability,
-the policy and evidence planes degrade and the reason lands in the manifest;
+the policy and observability planes degrade and the reason lands in the manifest;
 `actime doctor` inside the container tells you exactly what is missing.
 
 **What breaks.** Platforms that refuse extra capabilities leave you with the
-history plane and the process-level fallback only. Some platforms hide
+backup plane and the process-level fallback only. Some platforms hide
 `/sys/kernel/btf` — same result. And the tamper caveat above is inherent to
 the position, not a configuration problem.
 
@@ -166,9 +166,11 @@ containment is simply not part of this position's job.
 
 **What breaks.** Nothing isolates the agent's resources or filesystem view —
 that is what a sandbox is for, and Actime does not provide one. The policy
-plane still stops the effects its rules cover (`git push --force`, `rm -rf`,
-secret egress), but an unconstrained agent otherwise shares your machine.
-Pair position C with the `coding-agent-baseline` pack at minimum.
+plane stops the exec-level effects its rules cover (`git push --force`,
+`rm -rf`); the labeled secret-egress rules in the `information-flow` pack are
+expressible but not enforceable with released ActPlane 0.1.8 — see
+[policies.md](./policies.md). An unconstrained agent otherwise shares your
+machine. Pair position C with the `coding-agent-baseline` pack at minimum.
 
 ## Choosing
 
@@ -182,5 +184,5 @@ Pair position C with the `coding-agent-baseline` pack at minimum.
 
 Whichever position you choose, the artifacts are identical: a manifest, a
 report, and a run directory under `~/.local/share/actime/runs/<run-id>/`
-(override with `ACTIME_HOME`). See [evidence.md](./evidence.md) for the record
+(override with `ACTIME_HOME`). See [observability.md](./observability.md) for the record
 layout and [configuration.md](./configuration.md) for every config field.

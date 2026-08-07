@@ -15,8 +15,8 @@ docs/CONTRIBUTING.md (if present) for conventions. -->
 <!-- Check the ones that apply. -->
 
 - [ ] policy (ActPlane integration, policy packs)
-- [ ] evidence (AgentSight integration, evidence collection/export)
-- [ ] history (Akeep integration)
+- [ ] observability (AgentSight integration, observation collection/export)
+- [ ] backup (Akeep integration)
 - [ ] actime-core (config, profiles, run store, reports, doctor)
 - [ ] CLI surface (`docs/DESIGN.md` §10)
 - [ ] packaging / docs / CI (this directory scope)
@@ -40,7 +40,7 @@ If yes, summarize the contract change:
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace`
 - [ ] `actime doctor` is clean on my machine
-- [ ] `actime run --policy off --no-history -- /bin/echo hi` still runs end to end
+- [ ] `actime run --policy off --no-backup -- /bin/echo hi` still runs end to end
 
 ## Checklist
 

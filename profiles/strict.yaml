@@ -1,7 +1,7 @@
 # Actime profile: strict
 #
 # For CI runners, shared machines, and regulated repositories. Fail closed on
-# the policy plane: enforce must load or the run aborts. Evidence is exported
+# the policy plane: enforce must load or the run aborts. Observability is exported
 # for retention.
 #
 # Packs are only those that released ActPlane 0.1.8 can actually install and
@@ -18,13 +18,13 @@ policy:
     - no-vcs-write
   feedback: true
 
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   export: [otlp]
   redact: true
 
-history:
+backup:
   enabled: true
   commit_on_exit: true
 

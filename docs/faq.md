@@ -5,16 +5,16 @@ Short, direct answers. Where a claim is a contract, the
 
 ## Does Actime need root?
 
-No. The Actime binary and the history plane run unprivileged.
+No. The Actime binary and the backup plane run unprivileged.
 `actime run -- claude` works as a normal user.
 
-Only the **policy** (ActPlane) and **evidence** (AgentSight) planes need root
+Only the **policy** (ActPlane) and **observability** (AgentSight) planes need root
 or `CAP_BPF`, because they load eBPF programs into the kernel. When you run
 unprivileged, Actime launches the engines through `sudo` (interactively it may
 ask for your password once; in non-interactive sessions it uses `sudo -n` and
 fails fast instead of hanging). If the privileges are not there, those two
-planes degrade to `Disabled` with the reason in the report, while history and
-the process-level evidence fallback keep working. One exception: in
+planes degrade to `Disabled` with the reason in the report, while backup and
+the process-level observability fallback keep working. One exception: in
 `policy.mode: enforce` a policy plane that cannot start aborts the run
 (fail closed). Run `actime doctor` to see exactly which planes are available on
 your machine; it prints the `setcap` command that grants the engines
@@ -65,8 +65,8 @@ attach to containers, you never need a container runtime.
 
 Not in the path that matters. Actime does **not** proxy LLM traffic or sit
 between the agent and its model (that is an explicit non-goal). Agent network
-calls go direct. The only cost is the eBPF probes: the policy and evidence
-planes attach per-syscall programs in the kernel's fast path, and evidence is
+calls go direct. The only cost is the eBPF probes: the policy and observability
+planes attach per-syscall programs in the kernel's fast path, and the record is
 aggregated and written to the run directory, not copied through Actime on the
 hot path. For a typical coding session the per-syscall overhead is not
 noticeable relative to model latency.
@@ -77,8 +77,8 @@ No. Actime is local-first and ships **no telemetry**. All run data is written
 under `~/.local/share/actime/runs/<run-id>/` on your machine (override with
 `ACTIME_HOME`).
 
-The `evidence.export` field is reserved for optional sinks such as `otlp`; in
-0.1.0 it is recorded in the effective config but not yet wired to the evidence
+The `observability.export` field is reserved for optional sinks such as `otlp`; in
+0.1.0 it is recorded in the effective config but not yet wired to the observability
 engine, so nothing leaves the box. The only network traffic on the machine is
 the agent's own, which you control with the policy plane's `connect` rules.
 
@@ -90,8 +90,8 @@ is a separate project you install independently:
 | Plane | Project | Role | Installed via |
 |-------|---------|------|---------------|
 | Policy | [ActPlane](https://github.com/eunomia-bpf/ActPlane) | Compiles policy packs and enforces `notify` / `block` / `kill` effects in the kernel | `cargo install actplane` (≥ 0.1.8) |
-| Evidence | [AgentSight](https://github.com/eunomia-bpf/agentsight) | Records process, file, network, ssl, and resource events | `cargo install agentsight` (≥ 0.2.60) |
-| History | [Akeep](https://github.com/eunomia-bpf/akeep) | Records decisions and makes runs replayable | `cargo install akeep` (≥ 0.2.0) |
+| Observability | [AgentSight](https://github.com/eunomia-bpf/agentsight) | Records process, file, network, ssl, and resource events | `cargo install agentsight` (≥ 0.2.60) |
+| Backup | [Akeep](https://github.com/eunomia-bpf/akeep) | Records decisions and makes runs replayable | `cargo install akeep` (≥ 0.2.0) |
 
 Actime resolves each engine on `PATH`, then in `~/.local/share/actime/bin`
 (`$ACTIME_HOME/bin`), then in `~/.cargo/bin`. It calls the engine with the
@@ -120,7 +120,7 @@ else (see [policies.md](./policies.md)).
 ## What about macOS?
 
 Not supported. The prebuilt binaries are Linux-only (the installer refuses
-other platforms), and the **policy and evidence planes are Linux-only** because
+other platforms), and the **policy and observability planes are Linux-only** because
 they are eBPF programs that need a Linux kernel to attach to. Use a Linux
 machine, VM, or container.
 
@@ -129,7 +129,7 @@ machine, VM, or container.
 Under two directories:
 
 - `~/.local/share/actime/runs/<run-id>/` — one directory per run, holding the
-  manifest, effective config, the policy that was loaded, violations, evidence,
+  manifest, effective config, the policy that was loaded, violations, observations,
   engine logs, and the rendered report. Override the root with `ACTIME_HOME`.
 - `~/.config/actime/actime.yaml` — your user-level config (one of the
   resolution layers).
@@ -140,15 +140,29 @@ what is still running with `actime status`.
 ## Does Actime modify my codebase?
 
 Only the agent does. Actime itself writes to the run directory, never to your
-project. The one thing to be aware of: when the history plane is enabled with
-`history.commit_on_exit: true` (the default), Akeep commits the agent's session
-history when the run exits. If that is not what you want in a given repo,
+project. The one thing to be aware of: when the backup plane is enabled with
+`backup.commit_on_exit: true` (the default), Akeep commits the agent's session
+when the run exits. If that is not what you want in a given repo,
 disable it:
 
 ```yaml
-history:
+backup:
   commit_on_exit: false
 ```
+
+## Can Actime stop an agent from leaking my secrets?
+
+Not yet, and we would rather say that plainly than let you assume it. The
+`information-flow` pack expresses exactly this — data labeled from secret
+files (`.env`, `~/.ssh/id_*`, `~/.aws/credentials`, …) may not reach the
+network, with the label following the data across copies, pipes, and
+subprocesses — but enforcing it needs engine features (file-source label
+propagation, path matchers) that released ActPlane 0.1.8 does not provide on
+the attach path. The rule compiles; it does not install. `actime policy check`
+reports it as not enforceable, and `--policy enforce` refuses to start a run
+that requests it. What the policy plane enforces today is exec-level rules
+(`git --force`, `rm -rf`, `git push`), which hold below the tool layer. See
+[policies.md](./policies.md) for the full picture.
 
 ## Can I see what a policy will block before running?
 
@@ -157,20 +171,29 @@ Yes. The policy subcommand inspects packs without running anything:
 ```sh
 actime policy list                 # packs shipped with actime
 actime policy show coding-agent-baseline
-actime policy check                # compile the configured policy; loads nothing
-actime policy explain              # what this kernel can enforce before the fact
+actime policy check                # per rule: enforceable on this host, or not, and why
+actime policy explain              # how each clause lowers to kernel matchers
 ```
 
-`check` and `explain` call the installed `actplane` binary and need no
-privileges, so `check` belongs in CI.
+`check` is the useful one before a run: it prints a table of every configured
+rule with an enforceable yes/no and the missing engine feature when the answer
+is no. It loads nothing into the kernel and needs no privileges, so it belongs
+in CI — run it before any `enforce` gate, because `enforce` fails closed
+(aborts the run) when a requested rule is not enforceable.
 
 ## Is it safe to run in CI?
 
 Yes. A common pattern is to gate a job on policy:
 
 ```sh
+actime policy check    # first: confirm every configured rule is enforceable here
 actime run --profile strict --fail-on-violation -- ./run-agent-task.sh
 ```
+
+Run `actime policy check` first because `enforce` fails closed — a requested
+rule the runner's engine cannot install aborts the run before the agent
+starts. `check` needs no privileges and prints the per-rule table, so a CI
+lint step can catch a policy that would never load.
 
 `--fail-on-violation` forces exit code `3` on any `kill` or `block` violation,
 so a CI step fails cleanly when the agent steps out of bounds. Otherwise the

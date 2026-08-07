@@ -78,7 +78,7 @@ fn term_width() -> Option<usize> {
 }
 
 /// A status banner printed when a run starts.
-pub fn banner(run_id: &str, target: &str, policy: &str, evidence: &str) -> String {
+pub fn banner(run_id: &str, target: &str, policy: &str, observability: &str) -> String {
     format!(
         "{}  run {}   {} {}   {} {}   {} {}",
         bold("actime"),
@@ -87,8 +87,8 @@ pub fn banner(run_id: &str, target: &str, policy: &str, evidence: &str) -> Strin
         target,
         dim("policy:"),
         policy,
-        dim("evidence:"),
-        evidence,
+        dim("observability:"),
+        observability,
     )
 }
 

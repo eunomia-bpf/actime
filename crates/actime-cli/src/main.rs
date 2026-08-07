@@ -1,7 +1,7 @@
 //! The `actime` binary.
 //!
-//! Actime is the effect plane for AI coding agents: policy, evidence, and
-//! history attached to an agent wherever it already runs. Bring your own
+//! Actime is the effect plane for AI coding agents: policy, observability, and
+//! backup attached to an agent wherever it already runs. Bring your own
 //! execution environment. See `docs/DESIGN.md`.
 
 mod commands;
@@ -22,7 +22,7 @@ pub const EXIT_VIOLATION: i32 = 3;
 #[command(
     name = "actime",
     version,
-    about = "Effect plane for AI coding agents: kernel policy, system evidence, and session history. Bring your own execution environment.",
+    about = "Effect plane for AI coding agents: kernel policy, system observability, and session backup. Bring your own execution environment.",
     long_about = None,
     after_help = "EXAMPLES:\n  \
       # check what your machine supports\n  \
@@ -85,7 +85,7 @@ enum Commands {
         command: PolicyCommands,
     },
 
-    /// Manage agent session history.
+    /// Manage agent session backups (Akeep).
     Keep {
         #[command(subcommand)]
         command: KeepCommands,
@@ -111,13 +111,13 @@ struct RunArgs {
     #[arg(long, value_name = "MODE")]
     policy: Option<String>,
 
-    /// Turn off the evidence plane for this run.
+    /// Turn off the observability plane for this run.
     #[arg(long)]
-    no_evidence: bool,
+    no_observability: bool,
 
-    /// Turn off the history plane for this run.
+    /// Turn off the backup plane for this run.
     #[arg(long)]
-    no_history: bool,
+    no_backup: bool,
 
     /// Exit with code 3 if any rule blocked or killed an action.
     #[arg(long)]
@@ -197,7 +197,7 @@ enum PolicyCommands {
 
 #[derive(Subcommand)]
 enum KeepCommands {
-    /// Commit the current agent session history.
+    /// Commit the current agent session (Akeep).
     Commit {
         /// Commit message.
         #[arg(short, long)]
@@ -205,7 +205,7 @@ enum KeepCommands {
     },
     /// List committed versions.
     Log,
-    /// Restore a run's session history.
+    /// Restore a run's session backup (Akeep).
     Restore {
         /// Run id, or `latest`.
         #[arg(default_value = "latest")]
@@ -238,8 +238,8 @@ fn main() {
             run::RunRequest {
                 argv: a.cmd,
                 policy: a.policy,
-                no_evidence: a.no_evidence,
-                no_history: a.no_history,
+                no_observability: a.no_observability,
+                no_backup: a.no_backup,
                 fail_on_violation: a.fail_on_violation,
                 timeout: a.timeout,
             },
@@ -307,7 +307,7 @@ mod tests {
             "run",
             "--policy",
             "observe",
-            "--no-history",
+            "--no-backup",
             "--",
             "echo",
             "hi",
@@ -316,7 +316,7 @@ mod tests {
         match cli.command {
             Commands::Run(a) => {
                 assert_eq!(a.policy.as_deref(), Some("observe"));
-                assert!(a.no_history);
+                assert!(a.no_backup);
                 assert_eq!(a.cmd, vec!["echo", "hi"]);
             }
             _ => panic!("expected run"),

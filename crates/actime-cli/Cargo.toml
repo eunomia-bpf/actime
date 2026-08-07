@@ -1,6 +1,6 @@
 [package]
 name = "actime"
-description = "Effect plane for AI coding agents: kernel policy, system evidence, and session history — bring your own sandbox"
+description = "Effect plane for AI coding agents: kernel policy, system observability, and session backup — bring your own sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,11 +28,5 @@ serde_yaml.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.0"
-predicates = "3.1"
+serde_json.workspace = true
 tempfile.workspace = true
-
-# The integration suite under tests/cli.rs is owned by a parallel change and
-# scaffolds helpers before every test uses them. Allow dead_code so
-# `clippy -D warnings --all-targets` stays green without rewriting that file.
-[lints.rust]
-dead_code = "allow"

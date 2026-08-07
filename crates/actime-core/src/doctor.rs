@@ -137,7 +137,7 @@ fn check_deployment() -> Check {
         Check::warn(
             "deployment",
             "running inside a container (deployment B: in-sandbox Actime). \
-             Policy and evidence need CAP_BPF (and often CAP_PERFMON / CAP_SYS_ADMIN) \
+             Policy and observability need CAP_BPF (and often CAP_PERFMON / CAP_SYS_ADMIN) \
              granted to this container. In-container deployment does not provide the \
              host-side tamper-resistance guarantee: root inside can interfere with the recorder.",
             "Grant CAP_BPF (+CAP_PERFMON/CAP_SYS_ADMIN as required by the kernel) to this \
@@ -268,7 +268,7 @@ fn check_cap_bpf() -> Check {
     }
     Check::warn(
         "cap_bpf",
-        "neither root nor CAP_BPF; policy and evidence planes will disable",
+        "neither root nor CAP_BPF; policy and observability planes will disable",
         "Run as root, or grant CAP_BPF (e.g. `sudo setcap cap_bpf,cap_perfmon+ep $(which actplane)`), \
          or use `actime run` knowing those planes will degrade (see DESIGN.md §8)",
     )
@@ -361,11 +361,15 @@ fn check_config(cfg: &Config) -> Check {
     Check::ok(
         "config",
         format!(
-            "profile={} policy={} evidence={} history={}",
+            "profile={} policy={} observability={} backup={}",
             cfg.profile,
             cfg.policy.mode,
-            if cfg.evidence.enabled { "on" } else { "off" },
-            if cfg.history.enabled { "on" } else { "off" },
+            if cfg.observability.enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if cfg.backup.enabled { "on" } else { "off" },
         ),
     )
 }

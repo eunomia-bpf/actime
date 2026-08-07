@@ -17,7 +17,7 @@ jobs:
     name: test (stable)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,23 +38,25 @@ jobs:
         run: cargo test --workspace
 
   msrv:
-    name: build (msrv 1.82)
+    name: build (msrv 1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: dtolnay/rust-toolchain@1.85.0
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo build (no-default-targets)
-        run: cargo build --workspace --all-targets
+      # MSRV must compile the lockfile as consumers do, including integration
+      # test crates. Declared rust-version is 1.85 (edition2024 deps).
+      - name: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck

@@ -1,6 +1,6 @@
-# Evidence and reports
+# Observability and reports
 
-Every `actime run` produces a run record. The policy and evidence parts of it
+Every `actime run` produces a run record. The policy and observability parts of it
 are written by the kernel-side engines, not by the agent — so it is not
 something the agent authored. Whether the agent *can* tamper with it depends on
 where you deployed Actime: outside the sandbox (position A) the record is
@@ -26,9 +26,9 @@ Layout (some files exist only when the plane that writes them ran):
     audit.jsonl          ActPlane's audit log
     runs/run-<pid>-<ts>/ per-invocation dir written by ActPlane 0.1.x
       events.jsonl       raw ActPlane violation events (source of the harvest)
-  evidence.db            AgentSight's SQLite store                     (evidence plane)
+  observability.db            AgentSight's SQLite store                     (observability plane)
   policy-engine.log      engine stderr                                 (when attempted)
-  evidence-engine.log    engine stderr                                 (when attempted)
+  observability-engine.log    engine stderr                                 (when attempted)
 ```
 
 `manifest.json`, `actime.yaml`, and `report.md` are written for every run,
@@ -72,6 +72,14 @@ counters, and the violation table. The Markdown report (`--markdown`, and
 violations or events. The JSON report (`--json`) emits `{manifest, summary,
 violations, timeline}`.
 
+When a run was configured with policy rules this host's engine cannot enforce,
+the report also prints an **Unenforceable rules** section — rule, effect, and
+the missing engine feature for each — and the manifest carries the same list
+as `unenforceable_rules`. In `observe` mode the run proceeds with those rules
+unwatched and this section is how the record says so; in `enforce` mode the
+run aborts before the agent starts instead. `actime policy check` prints the
+same verdict before you run, without privileges.
+
 ## `violations.jsonl`
 
 One JSON object per line. The fields are exactly the `Violation` struct Actime
@@ -82,24 +90,31 @@ reads back:
 {"ts":"2026-08-04T15:33:41Z","rule":"no-secret-egress","effect":"kill","op":"connect","target":"203.0.113.9:443","pid":41307,"comm":"python3","reason":"This process holds data derived from a secret file and tried to open a network connection..."}
 ```
 
+The second line illustrates the format, not a violation you will see today:
+the `no-secret-egress` rule (pack `information-flow`) needs engine features
+released ActPlane 0.1.8 does not provide, so it cannot fire yet. Lines like
+the first — exec-level `kill` violations from `coding-agent-baseline` or
+`no-vcs-write` — are what the policy plane produces now. See
+[policies.md](./policies.md) for the enforceability status of each pack.
+
 `effect` is `notify`, `block`, or `kill`. In `observe` mode matches are
 recorded and nothing is stopped, which is how you see what `enforce` *would*
 have done before you turn it on. Malformed lines are skipped rather than
 failing the report.
 
-## `evidence.db`
+## `observability.db`
 
 AgentSight's SQLite store: model calls with token counts, process lineage,
 file activity, network endpoints, and resource samples. Actime aggregates the
 summary counters from it defensively: it queries `sqlite_master` and
 `PRAGMA table_info` first, and a schema it does not recognize degrades to zero
 counters rather than failing the report. If your counters are zero but
-`evidence.db` has rows, that is the cause; file an issue with the AgentSight
+`observability.db` has rows, that is the cause; file an issue with the AgentSight
 version. Because the schema is not a stable interface, check it before writing
 your own queries:
 
 ```console
-sqlite3 ~/.local/share/actime/runs/<run-id>/evidence.db ".tables"
+sqlite3 ~/.local/share/actime/runs/<run-id>/observability.db ".tables"
 ```
 
 The counters Actime knows how to read in 0.1.0: row counts and token sums from
@@ -109,10 +124,10 @@ counts from `audit_events`.
 
 ## Export and capture settings
 
-`actime.yaml` accepts three evidence knobs:
+`actime.yaml` accepts three observability knobs:
 
 ```yaml
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   export: [otlp]
@@ -120,44 +135,44 @@ evidence:
 ```
 
 Honest status in 0.1.0: `enabled` is fully wired (it turns the plane on and
-off, and `--no-evidence` overrides it). `capture`, `export`, and `redact` are
+off, and `--no-observability` overrides it). `capture`, `export`, and `redact` are
 parsed, validated into the effective config, and recorded in the run's
 `actime.yaml`, but Actime does not yet pass them to AgentSight; the engine
-runs as `agentsight record --no-server --db <run-dir>/evidence.db` with its own
+runs as `agentsight record --no-server --db <run-dir>/observability.db` with its own
 defaults. The `strict` profile sets `export: [otlp]` so the intent is on record
 for when the wiring lands. Treat any export pipeline as engine-side
 configuration for now, and check `actime doctor` and the run manifest rather
 than assuming a sink is live.
 
-## Session history
+## Session backup
 
-The history plane is [Akeep](https://github.com/eunomia-bpf/akeep). At the end
+The backup plane is [Akeep](https://github.com/eunomia-bpf/akeep). At the end
 of a run it commits the agent's own session files (Claude Code transcripts,
 Codex history, and the other providers Akeep supports) into a deduplicated,
 versioned repository:
 
 ```console
 actime keep log                       # versions, newest first (delegates to `akeep log`)
-actime keep restore latest            # restore a run's session history to a scratch dir
+actime keep restore latest            # restore a run's session backup to a scratch dir
 actime keep restore latest --to ./restored
 actime keep commit -m "before the migration"
 ```
 
-`keep restore` works for runs whose history plane actually committed; the
+`keep restore` works for runs whose backup plane actually committed; the
 commit id is stored in the manifest as `akeep_commit`. If the plane was
 disabled or degraded, the command says so instead of guessing. `actime attach`
-never commits history — there is no run exit to commit on — so attached runs
-show the history plane `Disabled` with the reason
-`attach does not commit history`.
+never commits a backup — there is no run exit to commit on — so attached runs
+show the backup plane `Disabled` with the reason
+`attach does not commit a backup`.
 
-This is a different thing from the evidence store, and both matter. The
-evidence store is what the kernel saw. The session history is what the agent
+This is a different thing from the observability store, and both matter. The
+observability store is what the kernel saw. The session history is what the agent
 *decided*: the prompts, the reasoning, the tool calls. Correlating the two is
 how you answer "why did it do that", not just "what did it do".
 
 Provider transcripts are mutable and providers may clean them up on their own
 schedules. If you care about being able to reconstruct a run months later,
-leave the history plane on.
+leave the backup plane on.
 
 ## Retention
 

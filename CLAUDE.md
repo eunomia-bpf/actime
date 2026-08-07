@@ -7,8 +7,8 @@ to this file so Claude Code, Codex, and others share the same instructions.
 
 Actime is the effect plane for AI coding agents. It attaches three planes to an
 agent wherever that agent already runs: policy
-([ActPlane](https://github.com/eunomia-bpf/ActPlane), eBPF), evidence
-([AgentSight](https://github.com/eunomia-bpf/agentsight), eBPF), and history
+([ActPlane](https://github.com/eunomia-bpf/ActPlane), eBPF), observability
+([AgentSight](https://github.com/eunomia-bpf/agentsight), eBPF), and backup
 ([Akeep](https://github.com/eunomia-bpf/akeep)).
 
 Actime does **not** manage sandboxes. Bring your own sandbox, or none at all.
@@ -36,7 +36,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all
 
 cargo run -p actime -- doctor
-cargo run -p actime -- run --policy off --no-history -- /bin/echo hi
+cargo run -p actime -- run --policy off --no-backup -- /bin/echo hi
 ```
 
 The three engines Actime drives are separate projects. Install them to exercise
@@ -49,7 +49,7 @@ cargo install actplane agentsight akeep
 ## Architecture
 
 ```
-crates/actime-core/      config, components, run store, evidence, reports, doctor
+crates/actime-core/      config, components, run store, observations, reports, doctor
 crates/actime-cli/       the `actime` binary and the run orchestration
 policies/                ActPlane DSL packs, embedded into the binary
 profiles/                observe / balanced / strict, embedded into the binary
@@ -84,7 +84,7 @@ nothing else on disk. If you add a pack, add it to `PACKS` there too.
   `sqlite_master` and `PRAGMA table_info` before selecting. A schema we do not
   recognize degrades to zero counters; it never fails the report.
 - **No unwrap/expect/panic in non-test code.** Return `anyhow::Result`.
-- **`PlaneStatus` has exactly three fields:** policy, evidence, history. There
+- **`PlaneStatus` has exactly three fields:** policy, observability, backup. There
   is no isolation plane.
 
 ## Policy changes

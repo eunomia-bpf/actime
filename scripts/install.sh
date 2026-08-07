@@ -10,7 +10,7 @@
 #   ACTIME_INSTALL_DIR   where to install the binary. Default: ~/.local/bin.
 #
 # Actime itself needs no privileges and sends nothing to the network at runtime.
-# The optional policy and evidence engines (actplane, agentsight) need root or
+# The optional policy and observability engines (actplane, agentsight) need root or
 # CAP_BPF; Actime degrades cleanly without them. See docs/faq.md.
 set -eu
 
@@ -142,7 +142,7 @@ echo
 echo "Actime runs with no privileges and no telemetry. The optional planes are"
 echo "separate binaries; install only what you need (Actime degrades cleanly):"
 echo "  cargo install actplane     # policy plane (needs root or CAP_BPF)"
-echo "  cargo install agentsight   # evidence plane (needs root or CAP_BPF)"
-echo "  cargo install akeep        # history plane (no privileges needed)"
+echo "  cargo install agentsight   # observability plane (needs root or CAP_BPF)"
+echo "  cargo install akeep        # backup plane (no privileges needed)"
 echo
 echo "Next: run 'actime doctor' to check your setup, then 'actime demo'."

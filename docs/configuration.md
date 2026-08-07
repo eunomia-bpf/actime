@@ -52,13 +52,13 @@ policy:
   files: []                  # extra ActPlane policy files
   feedback: true             # inject corrective feedback the agent can read
 
-evidence:
+observability:
   enabled: true
   capture: [process, file, network, ssl, resource]
   export: []                 # otlp | sqlite | json (json always written)
   redact: true               # strip auth headers and secret-shaped values
 
-history:
+backup:
   enabled: true
   commit_on_exit: true
   message: null              # default: "actime run <id>"
@@ -83,10 +83,24 @@ the agent under `actplane run` so enforcement is launch-time. For
 mode a failure to start the policy plane aborts the run (fail closed). In
 `observe` mode it degrades.
 
+Rule enforceability is checked before the agent starts. A rule is enforceable
+only if the installed ActPlane engine supports every feature the rule needs on
+the attach path; with released ActPlane 0.1.8 that admits exec sink rules (and
+plain connect) but not open/write sink rules or path contains/suffix matchers.
+`actime policy check` prints the per-rule verdict without loading anything. If
+any requested rule is not enforceable:
+
+- `mode: enforce` — the run aborts before the agent starts (exit 1), with the
+  rules and missing engine features named. Silent partial enforcement is the
+  worst outcome.
+- `mode: observe` — the run proceeds; the unenforceable rules are stored on
+  the manifest (`unenforceable_rules`) and printed in the report, so the record
+  says exactly what the run did not watch for.
+
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `mode` | enum | `enforce` | `off` = plane disabled. `observe` = log violations, never block. `enforce` = apply effects (notify / block / kill); fail closed on attach error. |
-| `packs` | list of pack names | `["coding-agent-baseline"]` | Built-in packs shipped under `policies/` and embedded in the binary: `coding-agent-baseline`, `no-vcs-write`, `no-secret-egress`. |
+| `mode` | enum | `enforce` | `off` = plane disabled. `observe` = log violations, never block. `enforce` = apply effects (notify / block / kill); fail closed on attach error or unenforceable rules. |
+| `packs` | list of pack names | `["coding-agent-baseline"]` | Built-in packs shipped under `policies/` and embedded in the binary: `coding-agent-baseline`, `no-vcs-write`, `information-flow`. The first two are exec-based and enforceable on released ActPlane 0.1.8; every rule in `information-flow` currently reports not enforceable (see above). |
 | `files` | list of paths | `[]` | Extra ActPlane policy files, merged on top of the packs. |
 | `feedback` | boolean | `true` | Whether ActPlane should deliver the rule's `because` text to the agent as corrective feedback. In 0.1.0 the generated `policy.yaml` always contains the feedback block; `false` is recorded and shown as `feedback off` in the plane status but does not yet remove it. |
 
@@ -95,10 +109,10 @@ composed, with the workspace path as the agent sees it — the real host path
 for `actime run`, or the guest path when Actime runs inside a container
 (deployment B). Use it so the same policy file works in both.
 
-### `evidence` -- evidence plane (AgentSight)
+### `observability` -- observability plane (AgentSight)
 
-The evidence plane records what the agent actually did. In 0.1.0 Actime
-invokes it as `agentsight record --no-server --db <run-dir>/evidence.db` with
+The observability plane records what the agent actually did. In 0.1.0 Actime
+invokes it as `agentsight record --no-server --db <run-dir>/observability.db` with
 `--pid <host pid>`, or `--binary-path docker://…` / `k8s://…` when the target
 is a container or pod. It is always fail-soft.
 
@@ -113,12 +127,12 @@ If `agentsight` is not installed or cannot start, the plane is disabled and
 Actime still records argv, exit code, and duration (the process-level
 fallback).
 
-### `history` -- history plane (Akeep)
+### `backup` -- backup plane (Akeep)
 
-The history plane records the agent's session files and makes runs replayable
+The backup plane records the agent's session files and makes runs replayable
 via Akeep. It runs after the agent exits, with a hard timeout so a stuck vault
-can never hang the run. `actime attach` never commits history; the plane shows
-`Disabled` with the reason `attach does not commit history`.
+can never hang the run. `actime attach` never commits a backup; the plane shows
+`Disabled` with the reason `attach does not commit a backup`.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -137,11 +151,18 @@ can never hang the run. `actime attach` never commits history; the plane shows
 A profile is a preset base layer. Choose one with `profile:` in `actime.yaml`
 or `--profile` on the CLI. File values are merged over the profile.
 
-| Profile | Policy | Evidence | History | Notes |
+| Profile | Policy | Observability | Backup | Notes |
 |---------|--------|----------|---------|-------|
 | `observe` | `observe`, `coding-agent-baseline`, feedback off (nothing blocked) | on | on | The onboarding default for a new team. Nothing is ever blocked. |
-| `balanced` (default) | `enforce`, `coding-agent-baseline`, feedback on | on | on | Blocks destructive and exfiltration-shaped effects; allows normal development. |
-| `strict` | `enforce`, `coding-agent-baseline` + `no-vcs-write` + `no-secret-egress`, feedback on | on, `export: [otlp]` (recorded; not yet wired to the engine in 0.1.0) | on | Also sets `limits.wall_clock: 4h`. Use for sensitive codebases and CI gates. |
+| `balanced` (default) | `enforce`, `coding-agent-baseline`, feedback on | on | on | Blocks destructive VCS operations and mass deletion; allows normal development. |
+| `strict` | `enforce`, `coding-agent-baseline` + `no-vcs-write`, feedback on | on, `export: [otlp]` (recorded; not yet wired to the engine in 0.1.0) | on | Also sets `limits.wall_clock: 4h`. Use for sensitive codebases and CI gates. |
+
+The `information-flow` pack ships with the binary but is part of no default
+profile: its rules need engine features released ActPlane 0.1.8 does not
+provide, so an `enforce` profile that included it would fail closed on every
+run. Add it to `policy.packs` explicitly when you want to track its
+enforceability (or once the engine supports it), and check first with
+`actime policy check`.
 
 ## CLI overrides
 
@@ -153,8 +174,8 @@ else. First-file-wins for config, then these flags win on top.
 | `--config <FILE>` | (resolution layer 1) | Load config from this file instead of searching. |
 | `--profile P` | `profile` | Use profile `P` as the base layer (`observe` / `balanced` / `strict` / path). |
 | `--policy MODE` | `policy.mode` | Force policy mode (`off` / `observe` / `enforce`). Also on `actime attach`. |
-| `--no-evidence` | `evidence.enabled` | Set to `false`. |
-| `--no-history` | `history.enabled` | Set to `false`. |
+| `--no-observability` | `observability.enabled` | Set to `false`. |
+| `--no-backup` | `backup.enabled` | Set to `false`. |
 | `--timeout <DURATION>` | `limits.wall_clock` | Kill the run after this long, e.g. `30m` or `2h`. |
 | `--fail-on-violation` | (exit code only) | Any `kill` or `block` violation forces exit code `3`. Does not change what the planes do. |
 
@@ -172,7 +193,7 @@ Beyond `run`, Actime exposes these commands (from
 
 ```
 actime init [--force] [--print]
-actime run [--policy MODE] [--no-evidence] [--no-history]
+actime run [--policy MODE] [--no-observability] [--no-backup]
            [--fail-on-violation] [--timeout D] -- <cmd>...
 actime attach (--pid N | --comm NAME | --container REF | --pod NS/POD)
               [--policy MODE]
@@ -188,12 +209,12 @@ actime doctor [--json]
 |---------|---------|
 | `actime init` | Write a starter `actime.yaml` for a profile. `--force` overwrites, `--print` skips writing. |
 | `actime run -- <cmd>...` | The main entry point. Everything after `--` is the agent command, run as a host child. No container is created. |
-| `actime attach` | Attach the policy and evidence planes to an already-running target: a host pid, a comm name, an existing Docker/Podman container, or an existing pod on this node. Post-hoc: it binds future events only, and never commits history. Actime never creates containers; a missing target is a clear error. |
+| `actime attach` | Attach the policy and observability planes to an already-running target: a host pid, a comm name, an existing Docker/Podman container, or an existing pod on this node. Post-hoc: it binds future events only, and never commits a backup. Actime never creates containers; a missing target is a clear error. |
 | `actime status` | List runs that are still in progress. |
 | `actime runs` | List recorded runs, newest first. `--json` for machines, `--limit N` to cap. |
 | `actime report` | Render a run's report. Accepts a run id or `latest`. `--json` or `--markdown`. |
-| `actime policy` | Inspect policy packs: `list`, `show PACK`, `check` (compile the configured policy without loading it), `explain` (what this kernel can enforce before the fact). `check` and `explain` call the installed `actplane` binary and need no privileges. |
-| `actime keep` | History operations: `commit` (with `-m MSG`), `log`, `restore RUN [--to DIR]`. All three delegate to the installed `akeep` binary. |
+| `actime policy` | Inspect policy packs: `list`, `show PACK`, `check`, `explain`. `check` composes the configured policy and prints a per-rule enforceability table for this host (rule, effect, enforceable yes/no, missing engine features); it loads nothing and needs no privileges. `explain` shows how each clause lowers to kernel matchers. Both call the installed `actplane` binary. |
+| `actime keep` | Backup operations: `commit` (with `-m MSG`), `log`, `restore RUN [--to DIR]`. All three delegate to the installed `akeep` binary. |
 | `actime doctor` | Fail-soft environment check, including which deployment position it detects. `--json` for machines. Exits `0` with warnings, `1` if any check failed. |
 
 There is no `sandbox` subcommand, no `--sandbox` flag, no `demo` command, and

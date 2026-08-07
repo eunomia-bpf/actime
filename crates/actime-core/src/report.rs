@@ -9,14 +9,14 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::evidence::{Evidence, Violation};
+use crate::observations::{Observations, Violation};
 use crate::run::{PlaneState, PlaneStatus, Run, RunSummary};
 
 /// Render a clean terminal report.
 ///
 /// Sections: Run header, Planes, Summary, Policy violations, Next steps.
 /// Columns are aligned; text is truncated to `width`. No ANSI colors.
-pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
+pub fn render_text(run: &Run, ev: &Observations, width: usize) -> String {
     let width = width.max(40);
     let mut out = String::new();
     let rule = "-".repeat(width.min(72));
@@ -57,8 +57,8 @@ pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
     if let Some(pid) = t.host_pid {
         let _ = writeln!(out, "  host_pid:   {pid}");
     }
-    if let Some(ref et) = t.evidence_target {
-        let _ = writeln!(out, "  evidence:   {et}");
+    if let Some(ref et) = t.observability_target {
+        let _ = writeln!(out, "  observability:   {et}");
     }
     if let Some(ref note) = t.note {
         let _ = writeln!(
@@ -73,8 +73,13 @@ pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
     let _ = writeln!(out, "Planes");
     let _ = writeln!(out, "{rule}");
     render_plane_line(&mut out, "policy", &run.manifest.planes.policy, width);
-    render_plane_line(&mut out, "evidence", &run.manifest.planes.evidence, width);
-    render_plane_line(&mut out, "history", &run.manifest.planes.history, width);
+    render_plane_line(
+        &mut out,
+        "observability",
+        &run.manifest.planes.observability,
+        width,
+    );
+    render_plane_line(&mut out, "backup", &run.manifest.planes.backup, width);
     let _ = writeln!(out);
 
     // --- Summary ---
@@ -125,7 +130,7 @@ pub fn render_text(run: &Run, ev: &Evidence, width: usize) -> String {
 }
 
 /// Render a Markdown report suitable for `report.md`.
-pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
+pub fn render_markdown(run: &Run, ev: &Observations) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# Actime run `{}`", run.manifest.id);
     let _ = writeln!(out);
@@ -170,8 +175,8 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
     if let Some(pid) = t.host_pid {
         let _ = writeln!(out, "| Host pid | {pid} |");
     }
-    if let Some(ref et) = t.evidence_target {
-        let _ = writeln!(out, "| Evidence target | `{}` |", escape_md(et));
+    if let Some(ref et) = t.observability_target {
+        let _ = writeln!(out, "| Observations target | `{}` |", escape_md(et));
     }
     if let Some(ref note) = t.note {
         let _ = writeln!(out, "| Note | {} |", escape_md(note));
@@ -214,10 +219,23 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
     if !run.manifest.unenforceable_rules.is_empty() {
         let _ = writeln!(out, "## Unenforceable rules");
         let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "These rules were in the composed policy but this host's ActPlane engine cannot install them. The observe/enforce run did not watch for them."
-        );
+        let refused = run
+            .manifest
+            .target
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("refused before agent launch"));
+        if refused {
+            let _ = writeln!(
+                out,
+                "These rules were in the composed policy but this host's ActPlane engine cannot install them. **The run was refused before the agent started** (fail-closed enforce)."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "These rules were in the composed policy but this host's ActPlane engine cannot install them. The observe/enforce run did not watch for them."
+            );
+        }
         let _ = writeln!(out);
         let _ = writeln!(out, "| Rule | Effect | Reason |");
         let _ = writeln!(out, "|------|--------|--------|");
@@ -281,7 +299,7 @@ pub fn render_markdown(run: &Run, ev: &Evidence) -> String {
 }
 
 /// Serialize `{manifest, summary, violations, timeline}` as pretty JSON.
-pub fn render_json(run: &Run, ev: &Evidence) -> Result<String> {
+pub fn render_json(run: &Run, ev: &Observations) -> Result<String> {
     let value = json!({
         "manifest": run.manifest,
         "summary": ev.summary,
@@ -298,7 +316,8 @@ pub fn render_json(run: &Run, ev: &Evidence) -> Result<String> {
 fn render_plane_line(out: &mut String, name: &str, state: &PlaneState, width: usize) {
     let label = state.label();
     let reason = state.reason().unwrap_or("");
-    let head = format!("  {name:<10} {label:<10}");
+    // "observability" is 13 chars; pad to 14 so Active/Degraded/Disabled column aligns.
+    let head = format!("  {name:<14} {label:<10}");
     if reason.is_empty() {
         let _ = writeln!(out, "{head}");
     } else {
@@ -371,17 +390,31 @@ fn render_violations_table(out: &mut String, violations: &[Violation], width: us
 fn plane_pairs(p: &PlaneStatus) -> [(&'static str, &PlaneState); 3] {
     [
         ("policy", &p.policy),
-        ("evidence", &p.evidence),
-        ("history", &p.history),
+        ("observability", &p.observability),
+        ("backup", &p.backup),
     ]
 }
 
-fn next_steps(run: &Run, ev: &Evidence) -> Vec<String> {
+fn next_steps(run: &Run, ev: &Observations) -> Vec<String> {
     let mut steps = Vec::new();
     let id = &run.manifest.id;
 
     steps.push(format!("actime report {id} --markdown"));
     steps.push(format!("actime report {id} --json"));
+
+    let refused = run
+        .manifest
+        .target
+        .note
+        .as_deref()
+        .is_some_and(|n| n.contains("refused before agent launch"));
+    if refused {
+        steps.push(
+            "This run was refused before the agent started. Drop unenforceable packs, \
+             use `--policy observe`, or run `actime policy check` / `actime doctor`."
+                .into(),
+        );
+    }
 
     if ev.summary.blocked > 0 || ev.summary.killed > 0 {
         steps.push(format!(
@@ -467,11 +500,11 @@ fn escape_md(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::evidence::Violation;
+    use crate::observations::Violation;
     use crate::run::{PlaneState, RunStore};
     use tempfile::TempDir;
 
-    fn synthetic_run() -> (tempfile::TempDir, Run, Evidence) {
+    fn synthetic_run() -> (tempfile::TempDir, Run, Observations) {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::open(tmp.path()).unwrap();
         let mut run = store
@@ -485,8 +518,8 @@ mod tests {
         run.manifest.target.kind = "command".into();
         run.manifest.target.spec = Some("claude".into());
         run.manifest.planes.policy = PlaneState::Degraded("CAP_BPF not available".into());
-        run.manifest.planes.evidence = PlaneState::Disabled("agentsight not found".into());
-        run.manifest.planes.history = PlaneState::Active;
+        run.manifest.planes.observability = PlaneState::Disabled("agentsight not found".into());
+        run.manifest.planes.backup = PlaneState::Active;
         run.save_manifest().unwrap();
 
         let violations = vec![
@@ -522,7 +555,7 @@ mod tests {
             ..Default::default()
         };
         let timeline = vec![];
-        let ev = Evidence {
+        let ev = Observations {
             violations,
             summary,
             timeline,

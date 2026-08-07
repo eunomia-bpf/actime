@@ -1,6 +1,6 @@
 [package]
 name = "actime-core"
-description = "Core configuration, run store, evidence aggregation, and reporting for Actime"
+description = "Core configuration, run store, observations aggregation, and reporting for Actime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -13,7 +13,7 @@
 # fails closed before starting the agent if this pack is selected. Use
 # `--policy observe` only if you want a dry run that records the gap.
 #
-# Contents: system fence, evidence integrity, credential access reporting, and
+# Contents: system fence, run-record integrity, credential access reporting, and
 # secret-egress (label from secret files may not reach the network).
 
 source AGENT = exec "**/claude"
@@ -58,12 +58,12 @@ rule system-fence:
   because "System paths under /etc, /usr, /bin, /sbin, and /boot are outside the agent's working tree. Edit files under ${WORKSPACE}, or ask the user to make system changes."
 
 # 2. The agent must not rewrite its own accountability record.
-rule evidence-integrity:
+rule run-record-integrity:
   block write file "${WORKSPACE}/.actime/**" if AGENT
   block unlink file "${WORKSPACE}/.actime/**" if AGENT
   block write file "**/.local/share/actime/**" if AGENT
   block unlink file "**/.local/share/actime/**" if AGENT
-  because "The agent must not edit or delete Actime run records. Leave evidence alone; ask the user if a run needs to be pruned."
+  because "The agent must not edit or delete Actime run records. Leave run records alone; ask the user if a run needs to be pruned."
 
 # 3. Credential reads are reported, not blocked — the useful control is where
 #    the data goes afterwards (see no-secret-egress).
