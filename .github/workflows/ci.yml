@@ -38,19 +38,20 @@ jobs:
         run: cargo test --workspace
 
   msrv:
-    name: build (msrv 1.85)
+    name: build (msrv 1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.89.0
 
       - uses: Swatinem/rust-cache@v2
 
       # MSRV must compile the lockfile as consumers do, including integration
-      # test crates. Declared rust-version is 1.85 (edition2024 deps).
+      # test crates. Declared rust-version is 1.89: rusqlite 0.41 requires it
+      # (#17), and it is the lowest release carrying the libsqlite3-sys fix.
       - name: cargo build --workspace --all-targets
         run: cargo build --workspace --all-targets --locked
 
