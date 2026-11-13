@@ -71,13 +71,13 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 /// Format a [`Duration`] back to a compact human string (preferring h/m/s).
 pub fn format_duration(d: &Duration) -> String {
     let secs = d.as_secs();
-    if secs > 0 && secs % 86400 == 0 {
+    if secs > 0 && secs.is_multiple_of(86400) {
         return format!("{}d", secs / 86400);
     }
-    if secs > 0 && secs % 3600 == 0 {
+    if secs > 0 && secs.is_multiple_of(3600) {
         return format!("{}h", secs / 3600);
     }
-    if secs > 0 && secs % 60 == 0 {
+    if secs > 0 && secs.is_multiple_of(60) {
         return format!("{}m", secs / 60);
     }
     if d.subsec_nanos() == 0 {
